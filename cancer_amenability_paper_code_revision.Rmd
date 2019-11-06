@@ -1,0 +1,1697 @@
+---
+#PROLOG   ###############################################################
+#R VERSION: 3.5.0
+#PROJECT: Manuscript entitled "Treatment amenability and racial/ethnic disparities in childhood and adolescent cancer survival in the United States"
+#PURPOSE: Code to generate results in paper
+#AUTHORS:  Kim Johnson and Arash Delavar
+#CREATED: June 14th, 2019
+#LATEST:  "`r format(Sys.time(), '%d %B, %Y')`" 
+#NOTES:   To obtain the datasets used for this paper, please fill out a SEER data use agreement at https://seer.cancer.gov/seertrack/data/request/ and send the approval to kijohnson@wustl.edu with your request. 
+#PROLOG   ###############################################################
+---
+#Load packages and open libraries used for the analysis
+```{r setup, include=FALSE}
+#install.packages("survminer") #for pairwise diffs
+#install.packages("survival")
+#install.packages("ggplot")
+#install.packages("multcomp") #for contrasts
+#install.packages("stringr")
+#install.packages("survivalAnalysis")
+#install.packages("broom") #for etable5 extraction of coefficients from models
+library(survival) #for calculating KM values
+library(survminer) #for pairwise diffs
+library(ggplot2) #for plotting KM curve
+library(multcomp) #for contrasts
+library(table1) #table 1
+library(survivalAnalysis) #for survival analyses
+library(broom) #etable 5
+```
+
+#Load datasets and merge
+```{r}
+CancerAmenability <- read.csv ("CancerAmenability7.csv")
+#update for revision to 2016 dx
+RSR <- read.csv("RSR13.csv") #relative survival rate data for childhood cancers
+m <- merge(CancerAmenability,RSR)
+```
+
+#Load function to calculate Wald interaction p-values (courtesy of coauthor Justin Barnes)
+```{r}
+#Justin try two
+wald.wrapper <- function(model.object,demographic,varname){
+  if("svyglm" %in% class(model.object)){
+    tryCatch(wald.tester(coefs=model.object$coefficients,vcovs=vcov(model.object),demographic,varname),error=function(e) c(NA,NA))
+  }
+  else if("coxph" %in% class(model.object)){
+    tryCatch(wald.tester(coefs=model.object$coefficients,vcovs=model.object$var,demographic,varname),error=function(e) c(NA,NA))
+  }
+  else if("lrm" %in% class(model.object)){
+    tryCatch(wald.tester(coefs=model.object$coefficients,vcovs=model.object$var,demographic,varname),error=function(e) c(NA,NA))
+  }
+  else if("lm" %in% class(model.object)){
+    tryCatch(wald.tester(coefs=model.object$coefficients,vcovs=vcovHC(model.object),demographic,varname),error=function(e) c(NA,NA))
+  }
+  else {
+    tryCatch(wald.tester(coefs=model.object$coefficients,vcovs=vcov(model.object),demographic,varname),error=function(e) c(NA,NA))
+  }
+}
+ 
+wald.tester <- function(coefs,vcovs,dem,varname){
+  if(is.null(names(coefs))) names(coefs) <- names(vcovs)
+  else{
+    yes1 <- grep(varname,names(coefs))
+    dg <- grep(dem,names(coefs))
+    yes <- dg[which(dg %in% yes1)]
+  }
+  R <- matrix(0,nrow=length(yes),ncol=length(coefs))
+  for(i in 1:length(yes)) R[i,yes[i]] <- 1
+  r <- rep(0,length(yes))
+  chivalue <- t(R%*%coefs-r)%*%solve(R%*%(vcovs)%*%t(R))%*%(R%*%coefs-r)
+  pval <- 1-pchisq(chivalue,length(yes))
+  return(c(pval,chivalue))
+}
+ 
+```
+
+#Clean data
+```{r}
+#new column names
+colnames(m)[colnames(m)=="Median.family.income..in.tens..2000"]<-"income"
+colnames(m)[colnames(m)=="X....High.school.education.2000"]<-"education"
+colnames(m)[colnames(m)=="Race.and.origin.recode..NHW..NHB..NHAIAN..NHAPI..Hispanic."]<-"Race"
+colnames(m)[colnames(m)=="SEER.cause.specific.death.classification"]<-"death"
+colnames(m)[colnames(m)=="Insurance.Recode..2007.."]<-"insurance"
+colnames(m)[colnames(m)=="ICCC.site.rec.extended.ICD.O.3.WHO.2008"]<-"ICCCnumber"
+colnames(m)[colnames(m)=="SEER.historic.stage.A..1973.2015."]<-"Stage"
+
+#Remove missing values from dataset
+m <- m[which(m$Race<9),] #9=Non-Hispanic unknown race
+m <- m[which(m$death<8),] #8=Missing/unknown COD, 9=N/A not first tumor
+m <- m[which(m$Survival.months<9999),] #9999=unknown
+m <- m[which(m$Relative>0),]
+m <- m[which(m$ICCCnumber<253),] #253=Not classified by ICCC or in situ
+m <- m[which(m$education<16382),] #16382=Blank(s)
+m <- m[which(m$income<16382),] #16382=Blank(s)
+
+#fix year values by adding 1800 per SEER data dictionary instructions
+m$Year.of.birth<-m$Year.of.birth+1800
+m$Year.of.diagnosis<-m$Year.of.diagnosis+1800
+
+table(m[which(m$Year.of.diagnosis>2007),]$insurance)
+```
+#Data management for analysis
+```{r}
+#Divide into 5 household income categories: from low to high
+c <- quantile(m$income,probs = c(.2,.4,.6,.8,1),na.rm = T)
+c
+#divide education into 5 categories: from low to high
+e <- quantile(m$education,probs = c(.2,.4,.6,.8,1),na.rm = T)
+e
+
+#recode sex and label
+m$Sex[m$Sex==1]<-0 #1=Male
+m$Sex[m$Sex==2]<-1 #2=Female
+m$Sex <- factor(m$Sex,levels = c(0,1),labels = c("Male","Female"))
+
+#RSR category
+m$RSR_Cat[m$Relative<0.70] <- 0 #low amenability
+m$RSR_Cat[m$Relative>=0.70 & m$Relative<=0.85] <- 1 #medium amenability
+m$RSR_Cat[m$Relative>0.85] <- 2 #high amenability
+m$RSR_Cat<-factor(m$RSR_Cat, levels=c(0,1,2), labels=c("low amenability", "medium amenability", "high amenability"))
+table(m$RSR_Cat)
+
+#RSR binary
+m$RSR_Bi[m$Relative<=0.50] <- 0 #<=50
+m$RSR_Bi[m$Relative>0.50] <- 1  #>50
+m$RSR_Bi<-factor(m$RSR_Bi, levels=c(0,1), labels=c("<=50", ">50"))
+table(m$RSR_Bi)
+tapply(m$Survival.months, m$RSR_Bi, median)
+
+#recode age
+m$Age[m$Age.at.diagnosis<5] <- 0
+m$Age[m$Age.at.diagnosis>=5 & m$Age.at.diagnosis<10]<-1
+m$Age[m$Age.at.diagnosis>=10 & m$Age.at.diagnosis<15]<-2
+m$Age[m$Age.at.diagnosis>=15]<-3
+m$Age <- factor(m$Age,levels=c(0:3),labels=c("0-4","5-9","10-14","15-19"))
+
+#recode income
+m$income_Cat[m$income<c[1]]<-0
+m$income_Cat[m$income>=c[1] & m$income<c[2]]<-1
+m$income_Cat[m$income>=c[2] & m$income<c[3]]<-2
+m$income_Cat[m$income>=c[3] & m$income<c[4]]<-3
+m$income_Cat[m$income>=c[4] ] <- 4
+
+#recode education
+m$edu_Cat[m$education<e[1]]<-0
+m$edu_Cat[m$education>=e[1] & m$education<e[2]]<-1
+m$edu_Cat[m$education>=e[2] & m$education<e[3]]<-2
+m$edu_Cat[m$education>=e[3] & m$education<e[4]]<-3
+m$edu_Cat[m$education>=e[4] ] <- 4
+
+#recode insurance
+m$insurance[m$insurance>=3 & m$insurance<=4] <- 3 #combine insured and insured no specifics
+m$insurance[m$insurance>4] <- NA #recode Insurance status unknown and blanks as NA
+
+#recode race
+m$Race[m$Race==1]<-0
+m$Race[m$Race==2]<-1
+m$Race[m$Race==3]<-2
+m$Race[m$Race==4]<-3
+m$Race[m$Race==5]<-4
+
+#label race
+m$Race<-factor(m$Race, levels=c(0:4), labels=c("White", "Black", "AIAN", "Asian", "Hispanic"))
+
+#create new var for KM curves
+m$RaceRSR <-ifelse(m$Race=='White' & m$RSR_Bi=='>50',0,0) + #set ref
+            ifelse(m$Race=='White' & m$RSR_Bi=='<=50',1,0) + 
+            ifelse(m$Race=='Black' & m$RSR_Bi=='>50',2,0) + 
+            ifelse(m$Race=='Black' & m$RSR_Bi=='<=50',3,0) + 
+            ifelse(m$Race=='AIAN' & m$RSR_Bi=='>50',4,0) + 
+            ifelse(m$Race=='AIAN' & m$RSR_Bi=='<=50',5,0) + 
+            ifelse(m$Race=='Asian' & m$RSR_Bi=='>50',6,0) + 
+            ifelse(m$Race=='Asian' & m$RSR_Bi=='<=50',7,0) +
+            ifelse(m$Race=='Hispanic' & m$RSR_Bi=='>50',8,0) + 
+            ifelse(m$Race=='Hispanic' & m$RSR_Bi=='<=50',9,0) 
+
+m$RaceRSR3 <-ifelse(m$Race=='White' & m$RSR_Cat=='high amenability',0,0) +
+            ifelse(m$Race=='White' & m$RSR_Cat=='medium amenability',1,0) + 
+            ifelse(m$Race=='White' & m$RSR_Cat=='low amenability',2,0) + 
+            ifelse(m$Race=='Black' & m$RSR_Cat=='high amenability',3,0) + 
+            ifelse(m$Race=='Black' & m$RSR_Cat=='medium amenability',4,0) + 
+            ifelse(m$Race=='Black' & m$RSR_Cat=='low amenability',5,0) + 
+            ifelse(m$Race=='AIAN' & m$RSR_Cat=='high amenability',6,0) + 
+            ifelse(m$Race=='AIAN' & m$RSR_Cat=='medium amenability',7,0) + 
+            ifelse(m$Race=='AIAN' & m$RSR_Cat=='low amenability',8,0) + 
+            ifelse(m$Race=='Asian' & m$RSR_Cat=='high amenability',9,0) + 
+            ifelse(m$Race=='Asian' & m$RSR_Cat=='medium amenability',10,0) +
+            ifelse(m$Race=='Asian' & m$RSR_Cat=='low amenability',11,0) +
+            ifelse(m$Race=='Hispanic' & m$RSR_Cat=='high amenability',12,0) + 
+            ifelse(m$Race=='Hispanic' & m$RSR_Cat=='medium amenability',13,0) +
+            ifelse(m$Race=='Hispanic' & m$RSR_Cat=='low amenability',14,0) 
+          
+m$RaceRSR<-factor(m$RaceRSR, levels=c(0:9), labels=c("White >50", "White <=50", "Black >50", "Black <=50", "AIAN >50", "AIAN <=50", "Asian >50", "Asian <=50", "Hispanic >50",  "Hispanic <=50"))
+
+m$RaceRSR3<-factor(m$RaceRSR3, levels=c(0:14), labels=c("White High", "White Medium", "White Low", "Black High", "Black Medium", "Black Low", "AIAN High", "AIAN Medium", "AIAN Low", "Asian High", "Asian Medium", "Asian Low", "Hispanic High",  "Hispanic Medium", "Hispanic Low"))
+
+#Recode cancer stage
+m$Stage[m$Stage==14] <- NA
+
+#I Leukemias, myeloproliferative diseases, and myelodysplastic diseases
+m$Cancer_Type[m$ICCCName=="I(a.1) Precursor cell leukemias"|
+                m$ICCCName=="I(a.2) Mature B-cell leukemias"|
+                m$ICCCName=="I(a.3) Mature T-cell and NK cell leukemias"|
+                m$ICCCName=="I(a.4) Lymphoid leukemia, NOS"|
+                m$ICCCName=="I(b) Acute myeloid leukemias"|
+                m$ICCCName=="I(c) Chronic myeloproliferative diseases"|
+                m$ICCCName=="I(d) Myelodysplastic syndrome and other myeloproliferative"|
+                m$ICCCName=="I(e) Unspecified and other specified leukemias"]<-0
+
+#II Lymphomas and reticuloendothelial neoplasms
+m$Cancer_Type[m$ICCCName=="II(a) Hodgkin lymphomas"|
+                m$ICCCName=="II(b.1) Precursor cell lymphomas"|
+                m$ICCCName=="II(b.2) Mature B-cell lymphomas except Burkitt lymphoma"|
+                m$ICCCName=="II(b.3) Mature T-cell and NK-cell lymphomas"|
+                m$ICCCName=="II(b.4) Non-Hodgkin lymphomas, NOS"|
+                m$ICCCName=="II(c) Burkitt lymphoma"|
+                m$ICCCName=="II(d) Miscellaneous lymphoreticular neoplasms"|
+                m$ICCCName=="II(e) Unspecified lymphomas"]<-1
+
+# III CNS and miscellaneous intracranial and intraspinal neoplasms
+m$Cancer_Type[m$ICCCName=="III(a.1) Ependymomas"|
+                m$ICCCName=="III(a.2) Choroid plexus tumor"|
+                m$ICCCName=="III(b) Astrocytomas"|
+                m$ICCCName=="III(c.1) Medulloblastomas"|
+                m$ICCCName=="III(c.2) PNET"|
+                m$ICCCName=="III(c.3) Medulloepithelioma"|
+                m$ICCCName=="III(c.4) Atypical teratoid/rhabdoid tumor"|
+                m$ICCCName=="III(d.1) Oligodendrogliomas"|
+                m$ICCCName=="III(d.2) Mixed and unspecified gliomas"|
+                m$ICCCName=="III(d.3) Neuroepithelial glial tumors of uncertain orig"|
+                m$ICCCName=="III(e.1) Pituitary adenomas and carcinomas"|
+                m$ICCCName=="III(e.2) Tumors of sellar region (craniopharyngiomas)"|
+                m$ICCCName=="III(e.3) Pineal parenchymal tumors"|
+                m$ICCCName=="III(e.4) Neuronal and mixed neuronal-glial tumors"|
+                m$ICCCName=="III(e.5) Meningiomas"|
+                m$ICCCName=="III(f) Unspecified intracranial and intraspinal neoplasms"]<-2
+
+# IV Neuroblastoma and other peripheral nervous cell tumors
+m$Cancer_Type[m$ICCCName=="IV(a) Neuroblastoma and ganglioneuroblastoma"|
+                m$ICCCName=="IV(b) Other peripheral nervous cell tumors"]<-3
+
+# V Retinoblastoma
+m$Cancer_Type[m$ICCCName=="V Retinoblastoma"]<-4
+
+# VI Renal tumors
+m$Cancer_Type[m$ICCCName=="VI(a.1) Nephroblastoma"|
+                m$ICCCName=="VI(a.2) Rhabdoid renal tumor"|
+                m$ICCCName=="VI(a.3) Kidney sarcomas"|
+                m$ICCCName=="VI(a.4) pPNET of kidney"|
+                m$ICCCName=="VI(b) Renal carcinomas"|
+                m$ICCCName=="VI(c) Unspecified malignant renal tumors"]<-5
+
+# VII Hepatic tumors
+m$Cancer_Type[m$ICCCName=="VII(a) Hepatoblastoma"|
+                m$ICCCName=="VII(b) Hepatic carcinomas"|
+                m$ICCCName=="VII(c) Unspecified malignant hepatic tumors"]<-6
+
+#VIII Malignant bone tumors
+m$Cancer_Type[m$ICCCName=="VIII(a) Osteosarcomas"|
+                m$ICCCName=="VIII(b) Chondrosarcomas"|
+                m$ICCCName=="VIII(c.1) Ewing tumor and Askin tumor of bone"|
+                m$ICCCName=="VIII(c.2) pPNET of bone"|
+                m$ICCCName=="VIII(d.1) Malignant fibrous neoplasms of bone"|
+                m$ICCCName=="VIII(d.2) Malignant chordomas"|
+                m$ICCCName=="VIII(d.3) Odontogenic malignant tumors"|
+                m$ICCCName=="VIII(d.4) Miscellaneous malignant bone tumors"|
+                m$ICCCName=="VIII(e) Unspecified malignant bone tumors"]<-7
+
+#IX Soft tissue and other extraosseous sarcomas
+m$Cancer_Type[m$ICCCName=="IX(a) Rhabdomyosarcomas"|
+                m$ICCCName=="IX(b.1) Fibroblastic and myofibroblastic tumors"|
+                m$ICCCName=="IX(b.2) Nerve sheath tumors"|
+                m$ICCCName=="IX(b.3) Other fibromatous neoplasms"|
+                m$ICCCName=="IX(c) Kaposi sarcoma"|
+                m$ICCCName=="IX(d.1) Ewing tumor and Askin tumor of soft tissue"|
+                m$ICCCName=="IX(d.2) pPNET of soft tissue"|
+                m$ICCCName=="IX(d.3) Extrarenal rhabdoid tumor"|
+                m$ICCCName=="IX(d.4) Liposarcomas"|
+                m$ICCCName=="IX(d.5) Fibrohistiocytic tumors"|
+                m$ICCCName=="IX(d.6) Leiomyosarcomas"|
+                m$ICCCName=="IX(d.7) Synovial sarcomas"|
+                m$ICCCName=="IX(d.8) Blood vessel tumors"|
+                m$ICCCName=="IX(d.9) Osseous & chondromatous neoplasms of soft tissue"|
+                m$ICCCName=="IX(d.10) Alveolar soft parts sarcoma"|
+                m$ICCCName=="IX(d.11) Miscellaneous soft tissue sarcomas"|
+                m$ICCCName=="IX(e) Unspecified soft tissue sarcomas"]<-8
+
+#X Germ cell tumors, trophoblastic tumors, and neoplasms of gonads
+m$Cancer_Type[m$ICCCName=="X(a.1) Intracranial & intraspinal germinomas"|
+m$ICCCName=="X(a.2) Intracranial & intraspinal teratomas"|
+m$ICCCName=="X(a.3) Intracranial & intraspinal embryonal carcinomas"|
+m$ICCCName=="X(a.4) Intracranial & intraspinal yolk sac tumor"|
+m$ICCCName=="X(a.5) Intracranial & intraspinal choriocarcinoma"|
+m$ICCCName=="X(a.6) Intracranial & intraspinal tumors of mixed forms"|
+m$ICCCName=="X(b.1) Germinomas: extracranial/extragonadal"|
+m$ICCCName=="X(b.2) Malignant teratomas: extracranial/extragonadal"|
+m$ICCCName=="X(b.3) Embryonal carcinomas: extracranial/extragonadal"|
+m$ICCCName=="X(b.4) Yolk sac tumor: extracranial/extragonadal"|
+m$ICCCName=="X(b.5) Choriocarcinomas: extracranial/extragonadal"|
+m$ICCCName=="X(b.6) Other mixed germ cell: extracranial/extragonadal"|
+m$ICCCName=="X(c.1) Malignant gonadal germinomas"|
+m$ICCCName=="X(c.2) Malignant gonadal teratomas"|
+m$ICCCName=="X(c.3) Gonadal embryonal carcinomas"|
+m$ICCCName=="X(c.4) Gonadal yolk sac tumor"|
+m$ICCCName=="X(c.5) Gonadal choriocarcinoma"|
+m$ICCCName=="X(c.6) Malignant gonadal tumors of mixed forms"|
+m$ICCCName=="X(c.7) Malignant gonadal gonadoblastoma"|
+m$ICCCName=="X(d) Gonadal carcinomas"|
+m$ICCCName=="X(e) Other and unspecified malignant gonadal tumors"]<-9
+
+#VI Other malignant epithelial neoplasms and malignant melanomas
+m$Cancer_Type[m$ICCCName=="XI(a) Adrenocortical carcinomas"|
+m$ICCCName=="XI(b) Thyroid carcinomas"|
+m$ICCCName=="XI(c) Nasopharyngeal carcinomas"|
+m$ICCCName=="XI(d) Malignant melanomas"|
+m$ICCCName=="XI(e) Skin carcinomas"|
+m$ICCCName=="XI(f.1) Carcinomas of salivary glands"|
+m$ICCCName=="XI(f.2) Carcinomas of colon and rectum"|
+m$ICCCName=="XI(f.3) Carcinomas of appendix"|
+m$ICCCName=="XI(f.4) Carcinomas of lung"|
+m$ICCCName=="XI(f.5) Carcinomas of thymus"|
+m$ICCCName=="XI(f.6) Carcinomas of breast"|
+m$ICCCName=="XI(f.7) Carcinomas of cervix uteri"|
+m$ICCCName=="XI(f.8) Carcinomas of bladder"|
+m$ICCCName=="XI(f.9) Carcinomas of eye"|
+m$ICCCName=="XI(f.10) Carcinomas of other specified sites"|
+m$ICCCName=="XI(f.11) Carcinomas of unspecified site"]<-10
+
+#VII Other and unspecified malignant neoplasms
+m$Cancer_Type[m$ICCCName=="XII(a.1) Gastrointestinal stromal tumor"|
+m$ICCCName=="XII(a.2) Pancreatoblastoma"|
+m$ICCCName=="XII(a.3) Pulmonary blastoma and pleuropulmonary blastoma"|
+m$ICCCName=="XII(a.4) Other complex mixed and stromal neoplasms"|
+m$ICCCName=="XII(a.5) Mesothelioma"|
+m$ICCCName=="XII(a.6) Other specified malignant tumors"|
+m$ICCCName=="XII(b) Other unspecified malignant tumors"]<-11
+
+m$Cancer_Type<-factor(m$Cancer_Type, levels=c(0:11), labels=c("Leukemias, myeloproliferative diseases, and myelodysplastic diseases", "Lymphomas and reticuloendothelial neoplasms", "CNS and miscellaneous intracranial and intraspinal neoplasms", "Neuroblastoma and other peripheral nervous cell tumors", "Retinoblastoma", "Renal tumors", "Hepatic tumors", "Malignant bone tumors", "Soft tissue and other extraosseous sarcomas",  "Germ cell tumors, trophoblastic tumors, and neoplasms of gonads", "Other malignant epithelial neoplasms and malignant melanomas", "Other and unspecified malignant neoplasms"))
+
+#Exlude those with other and unspecified tumors
+
+m<-m[which(m$Cancer_Type!="Other and unspecified malignant neoplasms"),]
+
+#make age at time of event, censoring, or study close 
+m$stop_age<-m$Age.at.diagnosis + ((m$Survival.months)/12) +0.041 #add 0.041 to everyone to increase accuracy and prevent kicking out those where stop time is = to start time (i.e. survival months = 0). 0.041 years=15/365.25 15/365.25 is the number of years in 15 days (i.e. 15 days*year/365.25 days). 15  days is the average days per month so for survival times between 0 and <1 month that are coded as 0 survival months, the average survival time should be approximately 15 days assuming survival time is randomly distributed through the one month for those with survival times under a month.
+class(m$stop_age)
+m$surv=m$stop_age-m$Age.at.diagnosis
+summary(m$surv)
+summary(m$Survival.months/12)
+
+```
+#Table 1
+```{r}
+#Descriptive demographics
+#observations 
+nrow(m)
+y<-rbind(table(m$RSR_Cat), round(prop.table(table(m$RSR_Cat))*100,1))
+rownames(y) <- c('Count','Percentage')
+y
+
+#age at dx
+quantile(m$Age.at.diagnosis)
+quantile(m[which(m$RSR_Cat=="low amenability"),]$Age.at.diagnosis)
+quantile(m[which(m$RSR_Cat=="medium amenability"),]$Age.at.diagnosis)
+quantile(m[which(m$RSR_Cat=="high amenability"),]$Age.at.diagnosis)
+
+#survival months
+quantile(m$Survival.months)
+quantile(m[which(m$RSR_Cat=="low amenability"),]$Survival.months)
+quantile(m[which(m$RSR_Cat=="medium amenability"),]$Survival.months)
+quantile(m[which(m$RSR_Cat=="high amenability"),]$Survival.months)
+
+#RSR
+quantile(m$Relative)
+quantile(m[which(m$RSR_Cat=="low amenability"),]$Relative)
+quantile(m[which(m$RSR_Cat=="medium amenability"),]$Relative)
+quantile(m[which(m$RSR_Cat=="high amenability"),]$Relative)
+
+#for variables, use table 1 function
+table1(~ Relative + Survival.months+Sex + Age.at.diagnosis + Age + Race|RSR_Cat, m)
+```
+#Table 2 - Cox models (unadjusted)
+```{r}
+#Counts all and deaths
+table(m$Race) #total diagnoses by race
+table(m[which(m$death==1),]$Race) #deaths by race
+table(m$Race, m$RSR_Cat) # total
+table(m[which(m$death==1),]$Race, m[which(m$death==1),]$RSR_Cat) #by RSR_Cat
+
+#using age as time scale
+category.mod1<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race, m, ties="breslow") 
+summary(category.mod1)
+
+#using age as time scale undjusted using contrasts to calculate subgroup HRs and CIs 
+category.mod1<-coxph(Surv(Age.at.diagnosis,stop_age,death==1)~Race + RSR_Cat + Race*RSR_Cat, m, ties="breslow") 
+summary(category.mod1)
+
+K <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White Low
+t<-glht(category.mod1, linfct=K)
+summary(t)
+tbl<-exp(cbind("HR" = coef(t), confint.default(t, level = 0.95)))
+
+KM <- matrix(c(1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White Medium
+tM<-glht(category.mod1, linfct=KM)
+summary(tM)
+tbm<-exp(cbind("HR" = coef(tM), confint.default(tM, level = 0.95)))
+tbm
+
+KH <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0), 1) #Black vs. White High
+tH<-glht(category.mod1, linfct=KH)
+summary(tH)
+tbh<-exp(cbind("HR" = coef(tH), confint.default(tH, level = 0.95)))
+
+K2 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White Low
+t2<-glht(category.mod1, linfct=K2)
+summary(t2)
+AIANWL<-exp(cbind("HR" = coef(t2), confint.default(t2, level = 0.95)))
+
+K2M <- matrix(c(0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White Medium
+t2M<-glht(category.mod1, linfct=K2M)
+summary(t2M)
+AIANWM<-exp(cbind("HR" = coef(t2M), confint.default(t2M, level = 0.95)))
+
+K2H <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0), 1) #AIAN vs. White High
+t2H<-glht(category.mod1, linfct=K2H)
+summary(t2H)
+AIANWH<-exp(cbind("HR" = coef(t2H), confint.default(t2H, level = 0.95)))
+
+K3 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Asian vs. White Low
+t3<-glht(category.mod1, linfct=K3)
+summary(t3)
+AWL<-exp(cbind("HR" = coef(t3), confint.default(t3, level = 0.95)))
+
+K3M<- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0), 1) #Asian vs. White Medium
+t3M<-glht(category.mod1, linfct=K3M)
+summary(t3M)
+AWM<-exp(cbind("HR" = coef(t3M), confint.default(t3M, level = 0.95)))
+
+K3H<- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 1) #Asian vs. White High
+t3H<-glht(category.mod1, linfct=K3H)
+summary(t3H)
+AWH<-exp(cbind("HR" = coef(t3H), confint.default(t3H, level = 0.95)))
+
+K4<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Hispanic vs. White Low
+t4<-glht(category.mod1, linfct=K4)
+summary(t4)
+HWL<-exp(cbind("HR" = coef(t4), confint.default(t4, level = 0.95)))
+
+K4M<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0), 1) #Hispanic vs. White Medium
+t4M<-glht(category.mod1, linfct=K4M)
+summary(t4M)
+HWM<-exp(cbind("HR" = coef(t4M), confint.default(t4M, level = 0.95)))
+
+K4H<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1), 1) #Hispanic vs. White High
+t4H<-glht(category.mod1, linfct=K4H)
+summary(t4H)
+HWH<-exp(cbind("HR" = coef(t4H), confint.default(t4H, level = 0.95)))
+
+#create table of HRs and 95% CIs
+contrast<-c("BWL", "BWM", "BWH", "AIANWL", "AIANWM", "AIANWH", "AWL", "AWM", "AWH", "HWL", "HWM", "HWH")
+unad<-cbind(contrast, rbind(tbl, tbm, tbh, AIANWL, AIANWM, AIANWH, AWL, AWM, AWH, HWL, HWM, HWH))
+unad
+unad2<-as.data.frame(unad)
+unad2
+unad2$HR<-round(as.numeric(as.character(unad2$HR)), digits=2)
+unad2$`2.5 %`<-round(as.numeric(as.character(unad2$`2.5 %`)), digits=2)
+unad2$`97.5 %`<-round(as.numeric(as.character(unad2$`97.5 %`)), digits=2)
+unad2
+print(unad2)
+
+#validate results for BWL using different model method
+category.mod1va<-coxph(Surv(Age.at.diagnosis,stop_age,death==1)~Race, m[which((m$Race=="Black"|m$Race=="White")& m$RSR_Cat=="low amenability"),], ties="breslow")
+summary(category.mod1va)
+
+#validate results for BWM using different model method:
+category.mod1vb<-coxph(Surv(Age.at.diagnosis,stop_age,death==1)~Race, m[which((m$Race=="Black"|m$Race=="White")& m$RSR_Cat=="medium amenability"),], ties="breslow")
+summary(category.mod1vb)
+
+#validate results for BWH using different model method:
+category.mod1vc<-coxph(Surv(Age.at.diagnosis,stop_age,death==1)~Race, m[which((m$Race=="Black"|m$Race=="White")& m$RSR_Cat=="high amenability"),], ties="breslow")
+summary(category.mod1vc)
+
+#Conclusion: very slight different in 100ths place.
+
+```
+#Table 2 - Interaction p-values for unadjusted models
+```{r}
+wald.wrapper(category.mod1,"Black","RSR")[1]
+wald.wrapper(category.mod1,"AIAN","RSR")[1]
+wald.wrapper(category.mod1,"Asian","RSR")[1]
+wald.wrapper(category.mod1,"Hispanic","RSR")[1]
+```
+#Table 2- Cox models (adjusted)
+```{r}
+#Using age as the time scale, adjusted all races no interaction using age as time scale
+category.mod1<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race + RSR_Cat + as.factor(edu_Cat)+as.factor(income_Cat), m, ties="breslow") 
+summary(category.mod1)
+
+#Using age as the time scale, adjusted All races by category using contrasts
+category.mod1<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race + RSR_Cat + Race*RSR_Cat+ as.factor(edu_Cat)+as.factor(income_Cat), m, ties="breslow") 
+summary(category.mod1)
+
+#22 coefficients for contrasts, interaction starts at  15
+K <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White Low
+t<-glht(category.mod1, linfct=K)
+summary(t)
+tbl<-exp(cbind("HR" = coef(t), confint.default(t, level = 0.95)))
+
+KM <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White Medium
+tM<-glht(category.mod1, linfct=KM)
+summary(tM)
+tbm<-exp(cbind("HR" = coef(tM), confint.default(tM, level = 0.95)))
+
+KH <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0), 1) #Black vs. White High
+tH<-glht(category.mod1, linfct=KH)
+summary(tH)
+tbh<-exp(cbind("HR" = coef(tH), confint.default(tH, level = 0.95)))
+
+K2 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White Low
+t2<-glht(category.mod1, linfct=K2)
+summary(t2)
+AIANWL<-exp(cbind("HR" = coef(t2), confint.default(t2, level = 0.95)))
+
+K2M <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White Medium
+t2M<-glht(category.mod1, linfct=K2M)
+summary(t2M)
+AIANWM<-exp(cbind("HR" = coef(t2M), confint.default(t2M, level = 0.95)))
+
+K2H <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0), 1) #AIAN vs. White High
+t2H<-glht(category.mod1, linfct=K2H)
+summary(t2H)
+AIANWH<-exp(cbind("HR" = coef(t2H), confint.default(t2H, level = 0.95)))
+
+K3 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Asian vs. White Low
+t3<-glht(category.mod1, linfct=K3)
+summary(t3)
+AWL<-exp(cbind("HR" = coef(t3), confint.default(t3, level = 0.95)))
+
+K3M<- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0), 1) #Asian vs. White Medium
+t3M<-glht(category.mod1, linfct=K3M)
+summary(t3M)
+AWM<-exp(cbind("HR" = coef(t3M), confint.default(t3M, level = 0.95)))
+
+K3H<- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 1) #Asian vs. White High
+t3H<-glht(category.mod1, linfct=K3H)
+summary(t3H)
+AWH<-exp(cbind("HR" = coef(t3H), confint.default(t3H, level = 0.95)))
+
+K4<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Hispanic vs. White Low
+t4<-glht(category.mod1, linfct=K4)
+summary(t4)
+HWL<-exp(cbind("HR" = coef(t4), confint.default(t4, level = 0.95)))
+
+K4M<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0), 1) #Hispanic vs. White Medium
+t4M<-glht(category.mod1, linfct=K4M)
+summary(t4M)
+HWM<-exp(cbind("HR" = coef(t4M), confint.default(t4M, level = 0.95)))
+
+K4H<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1), 1) #Hispanic vs. White High
+t4H<-glht(category.mod1, linfct=K4H)
+summary(t4H)
+HWH<-exp(cbind("HR" = coef(t4H), confint.default(t4H, level = 0.95)))
+
+#create table of HRs and 95% CIs
+contrast<-c("BWL", "BWM", "BWH", "AIANWL", "AIANWM", "AIANWH", "AWL", "AWM", "AWH", "HWL", "HWM", "HWH")
+adj<-cbind(contrast, rbind(tbl, tbm, tbh, AIANWL, AIANWM, AIANWH, AWL, AWM, AWH, HWL, HWM, HWH))
+adj
+adj2<-as.data.frame(adj)
+adj2
+adj2$HR<-round(as.numeric(as.character(adj2$HR)), digits=2)
+adj2$`2.5 %`<-round(as.numeric(as.character(adj2$`2.5 %`)), digits=2)
+adj2$`97.5 %`<-round(as.numeric(as.character(adj2$`97.5 %`)), digits=2)
+adj2
+print(adj2)
+```
+
+#Table 2 - Interaction p-values for adjusted models
+```{r}
+wald.wrapper(category.mod1,"Black","RSR")[1]
+wald.wrapper(category.mod1,"AIAN","RSR")[1]
+wald.wrapper(category.mod1,"Asian","RSR")[1]
+wald.wrapper(category.mod1,"Hispanic","RSR")[1]
+```
+
+#Table 3 - Cox models 50% cutoff (unadjusted)
+```{r}
+#Death counts by amenability
+
+d<-m[which(m$death==1),]
+table(d$Race, d$RSR_Bi) #deaths by amenability
+table(m$Race, m$RSR_Bi) #total by amenability
+
+#for revision and age as time scale-undjusted using contrasts to calculate subgroup HRs and CIs 
+category.mod2<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race + RSR_Bi + Race*RSR_Bi, m, ties="breslow") 
+summary(category.mod2)
+
+K <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White <=50
+t<-glht(category.mod2, linfct=K)
+summary(t)
+tbl<-exp(cbind("HR" = coef(t), confint.default(t, level = 0.95)))
+tbl
+
+KM <- matrix(c(1, 0, 0, 0, 0, 1, 0, 0, 0), 1) #Black vs. White >50
+tm<-glht(category.mod2, linfct=KM)
+summary(tm)
+tbl2<-exp(cbind("HR" = coef(tm), confint.default(tm, level = 0.95)))
+tbl2
+
+KM2 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White <=50
+tm2<-glht(category.mod2, linfct=KM2)
+summary(tm2)
+taian<-exp(cbind("HR" = coef(tm2), confint.default(tm2, level = 0.95)))
+taian
+
+KM3 <- matrix(c(0, 1, 0, 0, 0, 0, 1, 0, 0), 1) #AIAN vs. White >50
+tm3<-glht(category.mod2, linfct=KM3)
+summary(tm3)
+taian2<-exp(cbind("HR" = coef(tm3), confint.default(tm3, level = 0.95)))
+taian2
+
+KM4 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0), 1) #Asian vs. White <=50
+tm4<-glht(category.mod2, linfct=KM4)
+summary(tm4)
+tasian<-exp(cbind("HR" = coef(tm4), confint.default(tm4, level = 0.95)))
+tasian
+
+KM5 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 1, 0), 1) #Asian vs. White >50
+tm5<-glht(category.mod2, linfct=KM5)
+summary(tm5)
+tasian2<-exp(cbind("HR" = coef(tm5), confint.default(tm5, level = 0.95)))
+tasian2
+
+KM6 <- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0), 1) #Hispanic vs. White <=50
+tm6<-glht(category.mod2, linfct=KM6)
+summary(tm6)
+thispanic<-exp(cbind("HR" = coef(tm6), confint.default(tm6, level = 0.95)))
+thispanic
+
+KM7 <- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 1), 1) #Hispanic vs. White >50
+tm7<-glht(category.mod2, linfct=KM7)
+summary(tm7)
+thispanic2<-exp(cbind("HR" = coef(tm7), confint.default(tm7, level = 0.95)))
+thispanic2
+
+#create table of HRs and 95% CIs
+contrast<-c("BWLE50", "BWGT50", "AIANLE50", "AIANGT50", "AWLE50", "AWGT50",  "HWLE50", "HWGT50")
+unadj<-cbind(contrast, rbind(tbl, tbl2, taian, taian2, tasian, tasian2, thispanic, thispanic2))
+unadj
+unadj2<-as.data.frame(unadj)
+unadj2
+unadj2$HR<-round(as.numeric(as.character(unadj2$HR)), digits=2)
+unadj2$`2.5 %`<-round(as.numeric(as.character(unadj2$`2.5 %`)), digits=2)
+unadj2$`97.5 %`<-round(as.numeric(as.character(unadj2$`97.5 %`)), digits=2)
+unadj
+print(unadj2)
+```
+
+#Table 3 - Interaction p-values for 50% cutoff unadjusted models
+```{r}
+wald.wrapper(category.mod2,"Black","RSR")[1]
+wald.wrapper(category.mod2,"AIAN","RSR")[1]
+wald.wrapper(category.mod2,"Asian","RSR")[1]
+wald.wrapper(category.mod2,"Hispanic","RSR")[1]
+```
+
+#Table 3 - Cox models 50% cutoff (adjusted)
+```{r}
+#Adjusted All races by category using contrasts
+
+#Using age as time scale-Adjusted All races by category using contrasts
+category.mod2<-coxph(Surv(Age.at.diagnosis,stop_age,death==1)~Race + RSR_Bi + Race*RSR_Bi+ as.factor(edu_Cat)+as.factor(income_Cat), m, ties="breslow") 
+summary(category.mod2)
+
+#17 coefficients
+K <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White <=50
+t<-glht(category.mod2, linfct=K)
+summary(t)
+tbl<-exp(cbind("HR" = coef(t), confint.default(t, level = 0.95)))
+tbl
+
+KM <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0), 1) #Black vs. White >50
+tm<-glht(category.mod2, linfct=KM)
+summary(tm)
+tbl2<-exp(cbind("HR" = coef(tm), confint.default(tm, level = 0.95)))
+tbl2
+
+KM2 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White <=50
+tm2<-glht(category.mod2, linfct=KM2)
+summary(tm2)
+taian<-exp(cbind("HR" = coef(tm2), confint.default(tm2, level = 0.95)))
+taian
+
+KM3 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0), 1) #AIAN vs. White >50
+tm3<-glht(category.mod2, linfct=KM3)
+summary(tm3)
+taian2<-exp(cbind("HR" = coef(tm3), confint.default(tm3, level = 0.95)))
+taian2
+
+KM4 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Asian vs. White <=50
+tm4<-glht(category.mod2, linfct=KM4)
+summary(tm4)
+tasian<-exp(cbind("HR" = coef(tm4), confint.default(tm4, level = 0.95)))
+tasian
+
+KM5 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 1) #Asian vs. White >50
+tm5<-glht(category.mod2, linfct=KM5)
+summary(tm5)
+tasian2<-exp(cbind("HR" = coef(tm5), confint.default(tm5, level = 0.95)))
+tasian2
+
+KM6 <- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Hispanic vs. White <=50
+tm6<-glht(category.mod2, linfct=KM6)
+summary(tm6)
+thispanic<-exp(cbind("HR" = coef(tm6), confint.default(tm6, level = 0.95)))
+thispanic
+
+KM7 <- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1), 1) #Hispanic vs. White >50
+tm7<-glht(category.mod2, linfct=KM7)
+summary(tm7)
+thispanic2<-exp(cbind("HR" = coef(tm7), confint.default(tm7, level = 0.95)))
+thispanic2
+
+
+contrast<-c("BWLE50", "BWGT50", "AIANLE50", "AIANGT50", "AWLE50", "AWGT50",  "HWLE50", "HWGT50")
+adj<-cbind(contrast, rbind(tbl, tbl2, taian, taian2, tasian, tasian2, thispanic, thispanic2))
+adj
+adj2<-as.data.frame(adj)
+adj2
+adj2$HR<-round(as.numeric(as.character(adj2$HR)), digits=2)
+adj2$`2.5 %`<-round(as.numeric(as.character(adj2$`2.5 %`)), digits=2)
+adj2$`97.5 %`<-round(as.numeric(as.character(adj2$`97.5 %`)), digits=2)
+adj2
+print(adj2)
+
+
+#validate results for BW using different model method:
+category.mod1vb<-coxph(Surv(Age.at.diagnosis,stop_age,death==1)~Race, m[which((m$Race=="Black"|m$Race=="White")& m$RSR_Bi=="<=50"),], ties="breslow")
+summary(category.mod1vb)
+
+#validate results for BW using different model method:
+category.mod1vc<-coxph(Surv(Age.at.diagnosis,stop_age,death==1)~Race, m[which((m$Race=="Black"|m$Race=="White")& m$RSR_Bi==">50"),], ties="breslow")
+summary(category.mod1vc)
+
+#Conclusion: very slight different in 100ths place.
+
+```
+#Table 3 - Interactions p-values for Cox models 50% cutoff adjusted models
+```{r}
+wald.wrapper(category.mod2,"Black","RSR")[1]
+wald.wrapper(category.mod2,"AIAN","RSR")[1]
+wald.wrapper(category.mod2,"Asian","RSR")[1]
+wald.wrapper(category.mod2,"Hispanic","RSR")[1]
+```
+
+#eTable 2 - Cancer types
+```{r}
+m2<-data.frame(table(m$ICCCName))
+names(m2) <- c('ICCCName','Count')
+m3<-merge(m2,RSR, by='ICCCName')
+m3<- subset(m3, select = c('ICCCName', 'Count', 'Relative')) #keep ICCCName, Count, Relative
+m3<-m3[-c(1:45),] #drop rows 1:45
+
+m3$RSR_Cat[m3$Relative<0.70] <- 0 #low amenability
+m3$RSR_Cat[m3$Relative>=0.70 & m3$Relative<=0.85] <- 1 #medium amenability
+m3$RSR_Cat[m3$Relative>0.85] <- 2 #high amenability
+m3$RSR_Cat<-factor(m3$RSR_Cat, levels=c(0:2), labels=c("low", "medium", "high"))
+
+#RSR binary
+m3$RSR_Bi[m3$Relative<=0.50] <- 0 #<=50
+m3$RSR_Bi[m3$Relative>0.50] <- 1  #>50
+m3$RSR_Bi<-factor(m3$RSR_Bi, levels=c(0,1), labels=c("<=50", ">50"))
+print(m3[,c("ICCCName", "Count", "Relative", "RSR_Cat", "RSR_Bi")])
+write.table(m3, "eTable2.txt",  sep="\t")
+```
+
+#eTable 3 - Cox models with insurance status (supplement unadjusted)
+```{r}
+#Counts 
+table(m[which(m$Year.of.diagnosis>=2007 & m$insurance<4),]$Race) #total by race
+table(m[which(m$death==1 & m$Year.of.diagnosis>=2007 & m$insurance<4),]$Race) #total deaths by race
+
+table(m[which(m$Year.of.diagnosis>=2007 & m$insurance<4),]$Race, m[which(m$Year.of.diagnosis>=2007 & m$insurance<4),]$RSR_Cat)
+table(m[which(m$death==1 & m$Year.of.diagnosis>=2007 & m$insurance<4),]$Race, m[which(m$death==1 & m$Year.of.diagnosis>=2007 & m$insurance<4),]$RSR_Cat)
+
+#Cox - with all races and amenability levels
+category.mod1noints<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race, m, subset = m$Year.of.diagnosis>=2007 & m$insurance<4, ties="breslow") 
+summary(category.mod1noints)
+
+#for contrasts
+category.mod1s<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race+RSR_Cat+ Race*RSR_Cat, m, subset = m$Year.of.diagnosis>=2007 & m$insurance<4, ties="breslow")
+summary(category.mod1s)
+
+K <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ,0), 1) #Black vs. White Low
+t<-glht(category.mod1s, linfct=K)
+summary(t)
+tbl<-exp(cbind("HR" = coef(t), confint.default(t, level = 0.95)))
+
+KM <- matrix(c(1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White Medium
+tM<-glht(category.mod1s, linfct=KM)
+summary(tM)
+tbm<-exp(cbind("HR" = coef(tM), confint.default(tM, level = 0.95)))
+
+KH <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0), 1) #Black vs. White High
+tH<-glht(category.mod1s, linfct=KH)
+summary(tH)
+tbh<-exp(cbind("HR" = coef(tH), confint.default(tH, level = 0.95)))
+
+K2 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White Low
+t2<-glht(category.mod1s, linfct=K2)
+summary(t2)
+AIANWL<-exp(cbind("HR" = coef(t2), confint.default(t2, level = 0.95)))
+
+K2M <- matrix(c(0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White Medium
+t2M<-glht(category.mod1s, linfct=K2M)
+summary(t2M)
+AIANWM<-exp(cbind("HR" = coef(t2M), confint.default(t2M, level = 0.95)))
+
+K2H <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0), 1) #AIAN vs. White High
+t2H<-glht(category.mod1s, linfct=K2H)
+summary(t2H)
+AIANWH<-exp(cbind("HR" = coef(t2H), confint.default(t2H, level = 0.95)))
+
+K3 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Asian vs. White Low
+t3<-glht(category.mod1s, linfct=K3)
+summary(t3)
+AWL<-exp(cbind("HR" = coef(t3), confint.default(t3, level = 0.95)))
+
+K3M<- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0), 1) #Asian vs. White Medium
+t3M<-glht(category.mod1s, linfct=K3M)
+summary(t3M)
+AWM<-exp(cbind("HR" = coef(t3M), confint.default(t3M, level = 0.95)))
+
+K3H<- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 1) #Asian vs. White High
+t3H<-glht(category.mod1s, linfct=K3H)
+summary(t3H)
+AWH<-exp(cbind("HR" = coef(t3H), confint.default(t3H, level = 0.95)))
+
+K4<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Hispanic vs. White Low
+t4<-glht(category.mod1s, linfct=K4)
+summary(t4)
+HWL<-exp(cbind("HR" = coef(t4), confint.default(t4, level = 0.95)))
+
+K4M<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0), 1) #Hispanic vs. White Medium
+t4M<-glht(category.mod1s, linfct=K4M)
+summary(t4M)
+HWM<-exp(cbind("HR" = coef(t4M), confint.default(t4M, level = 0.95)))
+
+K4H<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1), 1) #Hispanic vs. White High
+t4H<-glht(category.mod1s, linfct=K4H)
+summary(t4H)
+HWH<-exp(cbind("HR" = coef(t4H), confint.default(t4H, level = 0.95)))
+
+#create table of HRs and CIs
+contrast<-c("BWL", "BWM", "BWH", "AIANWL", "AIANWM", "AIANWH", "AWL", "AWM", "AWH", "HWL", "HWM", "HWH")
+unadj<-cbind(contrast, rbind(tbl, tbm, tbh, AIANWL, AIANWM, AIANWH, AWL, AWM, AWH, HWL, HWM, HWH))
+unadj
+unadj2<-as.data.frame(unadj)
+unadj2
+unadj2$HR<-round(as.numeric(as.character(unadj2$HR)), digits=2)
+unadj2$`2.5 %`<-round(as.numeric(as.character(unadj2$`2.5 %`)), digits=2)
+unadj2$`97.5 %`<-round(as.numeric(as.character(unadj2$`97.5 %`)), digits=2)
+unadj2
+print(unadj2)
+
+```
+
+#eTable 3 - Interaction p-values for unadjusted Cox models with insurance status 
+```{r}
+wald.wrapper(category.mod1s,"Black","RSR")[1]
+wald.wrapper(category.mod1s,"AIAN","RSR")[1]
+wald.wrapper(category.mod1s,"Asian","RSR")[1]
+wald.wrapper(category.mod1s,"Hispanic","RSR")[1]
+```
+#eTable 3 - Cox models with insurance status (supplement adjusted)
+```{r}
+#adjusted
+category.mod1noints<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race+RSR_Cat +as.factor(insurance)+ as.factor(edu_Cat)+as.factor(income_Cat), m, subset = m$Year.of.diagnosis>=2007 & m$insurance<4, ties="breslow") 
+summary(category.mod1noints)
+
+#for contrasts
+category.mod1s<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race+RSR_Cat+ Race*RSR_Cat +as.factor(insurance)+ as.factor(edu_Cat)+as.factor(income_Cat), m, subset = m$Year.of.diagnosis>=2007 & m$insurance<4, ties="breslow") 
+summary(category.mod1s)
+
+K <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White Low
+t<-glht(category.mod1s, linfct=K)
+summary(t)
+tbl<-exp(cbind("HR" = coef(t), confint.default(t, level = 0.95)))
+
+KM <- matrix(c(1, 0, 0, 0, 0, 0, 0,0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White Medium
+tM<-glht(category.mod1s, linfct=KM)
+summary(tM)
+tbm<-exp(cbind("HR" = coef(tM), confint.default(tM, level = 0.95)))
+
+KH <- matrix(c(1, 0, 0, 0, 0,0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0), 1) #Black vs. White High
+tH<-glht(category.mod1s, linfct=KH)
+summary(tH)
+tbh<-exp(cbind("HR" = coef(tH), confint.default(tH, level = 0.95)))
+
+K2 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White Low
+t2<-glht(category.mod1s, linfct=K2)
+summary(t2)
+AIANWL<-exp(cbind("HR" = coef(t2), confint.default(t2, level = 0.95)))
+
+K2M <- matrix(c(0, 1, 0,0,0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White Medium
+t2M<-glht(category.mod1s, linfct=K2M)
+summary(t2M)
+AIANWM<-exp(cbind("HR" = coef(t2M), confint.default(t2M, level = 0.95)))
+
+K2H <- matrix(c(0, 1, 0, 0,0,0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0), 1) #AIAN vs. White High
+t2H<-glht(category.mod1s, linfct=K2H)
+summary(t2H)
+AIANWH<-exp(cbind("HR" = coef(t2H), confint.default(t2H, level = 0.95)))
+
+K3 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Asian vs. White Low
+t3<-glht(category.mod1s, linfct=K3)
+summary(t3)
+AWL<-exp(cbind("HR" = coef(t3), confint.default(t3, level = 0.95)))
+
+K3M<- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0), 1) #Asian vs. White Medium
+t3M<-glht(category.mod1s, linfct=K3M)
+summary(t3M)
+AWM<-exp(cbind("HR" = coef(t3M), confint.default(t3M, level = 0.95)))
+
+K3H<- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 1) #Asian vs. White High
+t3H<-glht(category.mod1s, linfct=K3H)
+summary(t3H)
+AWH<-exp(cbind("HR" = coef(t3H), confint.default(t3H, level = 0.95)))
+
+K4<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Hispanic vs. White Low
+t4<-glht(category.mod1s, linfct=K4)
+summary(t4)
+HWL<-exp(cbind("HR" = coef(t4), confint.default(t4, level = 0.95)))
+
+K4M<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0), 1) #Hispanic vs. White Medium
+t4M<-glht(category.mod1s, linfct=K4M)
+summary(t4M)
+HWM<-exp(cbind("HR" = coef(t4M), confint.default(t4M, level = 0.95)))
+
+K4H<- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1), 1) #Hispanic vs. White High
+t4H<-glht(category.mod1s, linfct=K4H)
+summary(t4H)
+HWH<-exp(cbind("HR" = coef(t4H), confint.default(t4H, level = 0.95)))
+
+contrast<-c("BWL", "BWM", "BWH", "AIANWL", "AIANWM", "AIANWH", "AWL", "AWM", "AWH", "HWL", "HWM", "HWH")
+adj<-cbind(contrast, rbind(tbl, tbm, tbh, AIANWL, AIANWM, AIANWH, AWL, AWM, AWH, HWL, HWM, HWH))
+adj
+adj2<-as.data.frame(adj)
+adj2
+adj2$HR<-round(as.numeric(as.character(adj2$HR)), digits=2)
+adj2$`2.5 %`<-round(as.numeric(as.character(adj2$`2.5 %`)), digits=2)
+adj2$`97.5 %`<-round(as.numeric(as.character(adj2$`97.5 %`)), digits=2)
+adj2
+print(adj2)
+
+```
+
+#eTable 3 - Interaction p-values for adjusted Cox models with insurance status 
+```{r}
+wald.wrapper(category.mod1s,"Black","RSR")[1]
+wald.wrapper(category.mod1s,"AIAN","RSR")[1]
+wald.wrapper(category.mod1s,"Asian","RSR")[1]
+wald.wrapper(category.mod1s,"Hispanic","RSR")[1]
+```
+
+#eTable 4 - Cox models with insurance status 50% cutoff (unadjusted)
+```{r}
+#Counts
+table(m[which(m$Year.of.diagnosis>=2007 & m$insurance<4),]$Race, m[which(m$Year.of.diagnosis>=2007 & m$insurance<4),]$RSR_Bi) #total
+
+table(m[which(m$death==1 & m$Year.of.diagnosis>=2007 & m$insurance<4),]$Race, m[which(m$death==1 & m$Year.of.diagnosis>=2007 & m$insurance<4),]$RSR_Bi) #deaths
+
+#Unadjusted All races by category using contrasts
+category.mod2s<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race + RSR_Bi + Race*RSR_Bi, m, subset = m$Year.of.diagnosis>=2007 & m$insurance<4, ties="breslow") 
+summary(category.mod2s)
+
+K <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White <=50
+t<-glht(category.mod2s, linfct=K)
+summary(t)
+tbl<-exp(cbind("HR" = coef(t), confint.default(t, level = 0.95)))
+tbl
+
+KM <- matrix(c(1, 0, 0, 0, 0, 1, 0, 0, 0), 1) #Black vs. White >50
+tm<-glht(category.mod2s, linfct=KM)
+summary(tm)
+tbl2<-exp(cbind("HR" = coef(tm), confint.default(tm, level = 0.95)))
+tbl2
+
+KM2 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White <=50
+tm2<-glht(category.mod2s, linfct=KM2)
+summary(tm2)
+taian<-exp(cbind("HR" = coef(tm2), confint.default(tm2, level = 0.95)))
+taian
+
+KM3 <- matrix(c(0, 1, 0, 0, 0, 0, 1, 0, 0), 1) #AIAN vs. White >50
+tm3<-glht(category.mod2s, linfct=KM3)
+summary(tm3)
+taian2<-exp(cbind("HR" = coef(tm3), confint.default(tm3, level = 0.95)))
+taian2
+
+KM4 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0), 1) #Asian vs. White <=50
+tm4<-glht(category.mod2s, linfct=KM4)
+summary(tm4)
+tasian<-exp(cbind("HR" = coef(tm4), confint.default(tm4, level = 0.95)))
+tasian
+
+KM5 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 1, 0), 1) #Asian vs. White >50
+tm5<-glht(category.mod2s, linfct=KM5)
+summary(tm5)
+tasian2<-exp(cbind("HR" = coef(tm5), confint.default(tm5, level = 0.95)))
+tasian2
+
+KM6 <- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0), 1) #Hispanic vs. White <=50
+tm6<-glht(category.mod2s, linfct=KM6)
+summary(tm6)
+thispanic<-exp(cbind("HR" = coef(tm6), confint.default(tm6, level = 0.95)))
+thispanic
+
+KM7 <- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 1), 1) #Hispanic vs. White >50
+tm7<-glht(category.mod2s, linfct=KM7)
+summary(tm7)
+thispanic2<-exp(cbind("HR" = coef(tm7), confint.default(tm7, level = 0.95)))
+thispanic2
+
+contrast<-c("BWLE50", "BWGT50", "AIANLE50", "AIANGT50", "AWLE50", "AWGT50",  "HWLE50", "HWGT50")
+unadj<-cbind(contrast, rbind(tbl, tbl2, taian, taian2, tasian, tasian2, thispanic, thispanic2))
+unadj
+unadj2<-as.data.frame(unadj)
+unadj2
+unadj2$HR<-round(as.numeric(as.character(unadj2$HR)), digits=2)
+unadj2$`2.5 %`<-round(as.numeric(as.character(unadj2$`2.5 %`)), digits=2)
+unadj2$`97.5 %`<-round(as.numeric(as.character(unadj2$`97.5 %`)), digits=2)
+unadj2
+print(unadj2)
+```
+#eTable 4 - Interaction p-values for unadjusted 50% cutoff Cox models with insurance status 
+```{r}
+wald.wrapper(category.mod2s,"Black","RSR")[1]
+wald.wrapper(category.mod2s,"AIAN","RSR")[1]
+wald.wrapper(category.mod2s,"Asian","RSR")[1]
+wald.wrapper(category.mod2s,"Hispanic","RSR")[1]
+```
+
+#eTable 4 - Cox models with insurance status 50% cutoff (adjusted)
+```{r}
+#Adjusted All races by category using contrasts
+category.mod2s<-coxph(Surv(Age.at.diagnosis,stop_age, death==1)~Race + RSR_Bi + Race*RSR_Bi+ as.factor(insurance)+as.factor(edu_Cat)+as.factor(income_Cat), m, ties="breslow") 
+summary(category.mod2s)
+
+K <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Black vs. White <=50
+t<-glht(category.mod2s, linfct=K)
+summary(t)
+tbl<-exp(cbind("HR" = coef(t), confint.default(t, level = 0.95)))
+tbl
+
+KM <- matrix(c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0), 1) #Black vs. White >50
+tm<-glht(category.mod2s, linfct=KM)
+summary(tm)
+tbl2<-exp(cbind("HR" = coef(tm), confint.default(tm, level = 0.95)))
+tbl2
+
+KM2 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #AIAN vs. White <=50
+tm2<-glht(category.mod2s, linfct=KM2)
+summary(tm2)
+taian<-exp(cbind("HR" = coef(tm2), confint.default(tm2, level = 0.95)))
+taian
+
+KM3 <- matrix(c(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0), 1) #AIAN vs. White >50
+tm3<-glht(category.mod2s, linfct=KM3)
+summary(tm3)
+taian2<-exp(cbind("HR" = coef(tm3), confint.default(tm3, level = 0.95)))
+taian2
+
+KM4 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Asian vs. White <=50
+tm4<-glht(category.mod2s, linfct=KM4)
+summary(tm4)
+tasian<-exp(cbind("HR" = coef(tm4), confint.default(tm4, level = 0.95)))
+tasian
+
+KM5 <- matrix(c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0), 1) #Asian vs. White >50
+tm5<-glht(category.mod2s, linfct=KM5)
+summary(tm5)
+tasian2<-exp(cbind("HR" = coef(tm5), confint.default(tm5, level = 0.95)))
+tasian2
+
+KM6 <- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 1) #Hispanic vs. White <=50
+tm6<-glht(category.mod2s, linfct=KM6)
+summary(tm6)
+thispanic<-exp(cbind("HR" = coef(tm6), confint.default(tm6, level = 0.95)))
+thispanic
+
+KM7 <- matrix(c(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1), 1) #Hispanic vs. White >50
+tm7<-glht(category.mod2s, linfct=KM7)
+summary(tm7)
+thispanic2<-exp(cbind("HR" = coef(tm7), confint.default(tm7, level = 0.95)))
+thispanic2
+
+contrast<-c("BWLE50", "BWGT50", "AIANLE50", "AIANGT50", "AWLE50", "AWGT50",  "HWLE50", "HWGT50")
+adj<-cbind(contrast, rbind(tbl, tbl2, taian, taian2, tasian, tasian2, thispanic, thispanic2))
+adj
+adj2<-as.data.frame(adj)
+adj2
+adj2$HR<-round(as.numeric(as.character(adj2$HR)), digits=2)
+adj2$`2.5 %`<-round(as.numeric(as.character(adj2$`2.5 %`)), digits=2)
+adj2$`97.5 %`<-round(as.numeric(as.character(adj2$`97.5 %`)), digits=2)
+adj2
+
+adj2$CI<-paste(adj2$`2.5 %`, adj2$`97.5 %`, sep="-")
+print(adj2)
+```
+
+#eTable 4 - Interaction p-values for adjusted 50% cutoff Cox models with insurance status 
+```{r}
+wald.wrapper(category.mod2s,"Black","RSR")[1]
+wald.wrapper(category.mod2s,"AIAN","RSR")[1]
+wald.wrapper(category.mod2s,"Asian","RSR")[1]
+wald.wrapper(category.mod2s,"Hispanic","RSR")[1]
+```
+
+#Figure 1 KM curves
+```{r}
+#Black vs. white
+raceBlack.surv <- survfit(Surv(Survival.months, death==1) ~ RaceRSR, data=m[which(m$RaceRSR=="White <=50"|m$RaceRSR=="Black <=50"|m$RaceRSR=="White >50"|m$RaceRSR=="Black >50"),])
+
+#check selection of correct obs using different coding strategy
+raceBlackb.surv<- survfit(Surv(Survival.months, death==1) ~ RaceRSR, data=m[which((m$Race=="White"  & m$RSR_Bi=="<=50")|(m$Race=="Black" & m$RSR_Bi=="<=50")|(m$Race=="White" & m$RSR_Bi==">50")|(m$Race=="Black"& m$RSR_Bi==">50")),]) #same curve produced
+
+a<-ggsurvplot(raceBlack.surv,  ylim=c(0.3,1), xlim=c(0,100), size=0.6, linetype=c("solid", "dashed", "solid", "dashed"), palette=c( "blue", "blue4",  "darkgreen", "green4"),  conf.int=FALSE, ncensor.plot.height=FALSE,  risk.table = T, risk.table.y.text.col=T, risk.table.y.text = FALSE, legend.labs=c("NH White >50% RSR","NH White \u226450% RSR",  "NH Black >50% RSR", "NH Black \u226450% RSR"),xlab=c("Months"), legend=c("bottom"), fontsize=3, font.legend=c(8, "bold"), censor.shape="|", censor.size=1, tables.theme = theme_cleantable(), title = "A. Comparison: NH White and NH Black")
+
+a
+
+e<-ggsurvplot(raceBlackb.surv,  ylim=c(0.3,1), xlim=c(0,100), size=0.6, linetype=c("solid", "dashed", "solid", "dashed"), palette=c( "blue", "blue4",  "darkgreen", "green4"),  conf.int=FALSE, ncensor.plot.height=FALSE,  risk.table = T, risk.table.y.text.col=T, risk.table.y.text = FALSE, legend.labs=c("NH White >50% RSR","NH White \u226450% RSR",  "NH Black >50% RSR", "NH Black \u226450% RSR"),xlab=c("Months"), legend=c("bottom"), fontsize=3, font.legend=c(8, "bold"), censor.shape="|", censor.size=1, tables.theme = theme_cleantable(), title = "A. Comparison: NH White and NH Black")
+
+e
+
+#AIAN vs. white
+raceAIAN.surv <- survfit(Surv(Survival.months,death==1) ~ RaceRSR, data=m[which(m$RaceRSR=="White <=50"|m$RaceRSR=="AIAN <=50"|m$RaceRSR=="White >50"|m$RaceRSR=="AIAN >50"),])
+
+b<-ggsurvplot(raceAIAN.surv,  ylim=c(0.3,1), xlim=c(0,100), size=0.6, linetype=c("solid", "dashed", "solid", "dashed"), palette=c( "blue", "blue4",  "darkgreen", "green4"),  conf.int=FALSE, ncensor.plot.height=FALSE,  risk.table = T, risk.table.y.text.col=T, risk.table.y.text = FALSE, legend.labs=c("NH White >50% RSR","NH White \u226450% RSR",  "NH AI/AN >50% RSR", "NH AI/AN \u226450% RSR"),xlab=c("Months"), legend=c("bottom"), fontsize=3, font.legend=c(8, "bold"), censor.shape="|", censor.size=1, tables.theme = theme_cleantable(), title = "B. Comparison: NH White and NH American Indian/Alaskan Native")
+
+print(b, surv.plot.height = 1,
+  risk.table.height = 0.3, newpage = TRUE)
+
+#Asian vs. white
+raceAsian.surv <- survfit(Surv(Survival.months, death==1) ~ RaceRSR, data=m[which(m$RaceRSR=="White <=50"|m$RaceRSR=="Asian <=50"|m$RaceRSR=="White >50"|m$RaceRSR=="Asian >50"),])
+
+c<-ggsurvplot(raceAsian.surv,  ylim=c(0.3,1), xlim=c(0,100), size=0.6, linetype=c("solid", "dashed", "solid", "dashed"), palette=c( "blue", "blue4",  "darkgreen", "green4"),  conf.int=FALSE, ncensor.plot.height=FALSE,  risk.table = T, risk.table.y.text.col=T, risk.table.y.text = FALSE, legend.labs=c("NH White >50% RSR","NH White \u226450% RSR",  "NH API >50% RSR", "NH API \u226450% RSR"),xlab=c("Months"), legend=c("bottom"), fontsize=3, font.legend=c(8, "bold"), censor.shape="|", censor.size=1, tables.theme = theme_cleantable(), title = "C. Comparison: NH White and Asian or Pacific Islander")
+
+print(c, surv.plot.height = 1,
+  risk.table.height = 0.3, newpage = TRUE)
+
+#Hispanic vs. white
+raceHispanic.surv <- survfit(Surv(Survival.months, death==1) ~ RaceRSR, data=m[which(m$RaceRSR=="White <=50"|m$RaceRSR=="Hispanic <=50"|m$RaceRSR=="White >50"|m$RaceRSR=="Hispanic >50"),])
+
+d<-ggsurvplot(raceHispanic.surv,  ylim=c(0.3,1), xlim=c(0, 100), size=0.6, linetype="strata", palette=c( "blue", "blue4",  "darkgreen", "green4"),  conf.int=FALSE, ncensor.plot.height=FALSE, risk.table = T, risk.table.y.text.col=T, risk.table.y.text = FALSE, legend.labs=c("NH White >50% RSR","NH White \u226450% RSR",  "Hispanic >50% RSR", "Hispanic \u226450% RSR"), xlab=c("Months"), legend=c("bottom"), fontsize=3, font.legend=c(8, "bold"), censor.shape="|", censor.size=1, tables.theme = theme_cleantable(), title = "D. Comparison: NH White and Hispanic (any race)")
+
+
+print(d, surv.plot.height = 1,
+  risk.table.height = 0.3, newpage = TRUE)
+```
+#eTable 5: Unadjusted cancer disparites by cancer types with different amenability levels
+```{r}
+#I(a.1) Precursor cell leukemias 13478  0.871
+mPCL<-m[which(m$ICCCName=="I(a.1) Precursor cell leukemias"),]
+addmargins(table(mPCL$Race, mPCL$death))
+PCL<-coxph(formula = Surv(Age.at.diagnosis, stop_age,death==1) ~ Race, data =mPCL, ties = "breslow")
+summary(PCL)
+
+PCLresults<-tidy(PCL)
+PCLresults
+
+PCL_HRBlack<-round(exp(PCLresults$estimate[1]), 2)
+PCL_BlackCIlow<-round(exp(PCLresults$conf.low[1]), 2)
+PCL_BlackCIhigh<-round(exp(PCLresults$conf.high[1]),2)
+PCL_HRAIAN<-round(exp(PCLresults$estimate[2]),2)
+PCL_AIANCIlow<-round(exp(PCLresults$conf.low[2]),2)
+PCL_AIANCIhigh<-round(exp(PCLresults$conf.high[2]),2)
+PCL_HRAsian<-round(exp(PCLresults$estimate[3]),2)
+PCL_AsianCIlow<-round(exp(PCLresults$conf.low[3]),2)
+PCL_AsianCIhigh<-round(exp(PCLresults$conf.high[3]),2)
+PCL_HRHispanic<-round(exp(PCLresults$estimate[4]),2)
+PCL_HispanicCIlow<-round(exp(PCLresults$conf.low[4]),2)
+PCL_HispanicCIhigh<-round(exp(PCLresults$conf.high[4]),2)
+
+
+#II(a) Hodgkin lymphomas  4706  0.964
+mHL<-m[which(m$ICCCName=="II(a) Hodgkin lymphomas"),]
+addmargins(table(mHL$Race, mHL$death))
+HL<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race , data =mHL, ties = "breslow")
+summary(HL)
+
+
+HLresults<-tidy(HL)
+HLresults
+
+HL_HRBlack<-round(exp(HLresults$estimate[1]), 2)
+HL_BlackCIlow<-round(exp(HLresults$conf.low[1]), 2)
+HL_BlackCIhigh<-round(exp(HLresults$conf.high[1]),2)
+HL_HRAIAN<-round(exp(HLresults$estimate[2]),2)
+HL_AIANCIlow<-round(exp(HLresults$conf.low[2]),2)
+HL_AIANCIhigh<-round(exp(HLresults$conf.high[2]),2)
+HL_HRAsian<-round(exp(HLresults$estimate[3]),2)
+HL_AsianCIlow<-round(exp(HLresults$conf.low[3]),2)
+HL_AsianCIhigh<-round(exp(HLresults$conf.high[3]),2)
+HL_HRHispanic<-round(exp(HLresults$estimate[4]),2)
+HL_HispanicCIlow<-round(exp(HLresults$conf.low[4]),2)
+HL_HispanicCIhigh<-round(exp(HLresults$conf.high[4]),2)
+
+
+#III(b) Astrocytomas 5781 0.824
+mAstro<-m[which(m$ICCCName=="III(b) Astrocytomas"),]
+addmargins(table(mAstro$Race, mAstro$death))
+Astro<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race, data =mAstro, ties = "breslow")
+summary(Astro)
+
+Astroresults<-tidy(Astro)
+Astroresults
+
+Astro_HRBlack<-round(exp(Astroresults$estimate[1]), 2)
+Astro_BlackCIlow<-round(exp(Astroresults$conf.low[1]), 2)
+Astro_BlackCIhigh<-round(exp(Astroresults$conf.high[1]),2)
+Astro_HRAIAN<-round(exp(Astroresults$estimate[2]),2)
+Astro_AIANCIlow<-round(exp(Astroresults$conf.low[2]),2)
+Astro_AIANCIhigh<-round(exp(Astroresults$conf.high[2]),2)
+Astro_HRAsian<-round(exp(Astroresults$estimate[3]),2)
+Astro_AsianCIlow<-round(exp(Astroresults$conf.low[3]),2)
+Astro_AsianCIhigh<-round(exp(Astroresults$conf.high[3]),2)
+Astro_HRHispanic<-round(exp(Astroresults$estimate[4]),2)
+Astro_HispanicCIlow<-round(exp(Astroresults$conf.low[4]),2)
+Astro_HispanicCIhigh<-round(exp(Astroresults$conf.high[4]),2)
+
+
+#I(b) Acute myeloid leukemias  0.611
+mAML<-m[which(m$ICCCName=="I(b) Acute myeloid leukemias"),]
+addmargins(table(mAML$Race, mAML$death))
+AML<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race, data =mAML, ties = "breslow")
+summary(AML)
+
+AMLresults<-tidy(AML)
+AMLresults
+
+AML_HRBlack<-round(exp(AMLresults$estimate[1]), 2)
+AML_BlackCIlow<-round(exp(AMLresults$conf.low[1]), 2)
+AML_BlackCIhigh<-round(exp(AMLresults$conf.high[1]),2)
+AML_HRAIAN<-round(exp(AMLresults$estimate[2]),2)
+AML_AIANCIlow<-round(exp(AMLresults$conf.low[2]),2)
+AML_AIANCIhigh<-round(exp(AMLresults$conf.high[2]),2)
+AML_HRAsian<-round(exp(AMLresults$estimate[3]),2)
+AML_AsianCIlow<-round(exp(AMLresults$conf.low[3]),2)
+AML_AsianCIhigh<-round(exp(AMLresults$conf.high[3]),2)
+AML_HRHispanic<-round(exp(AMLresults$estimate[4]),2)
+AML_HispanicCIlow<-round(exp(AMLresults$conf.low[4]),2)
+AML_HispanicCIhigh<-round(exp(AMLresults$conf.high[4]),2)
+
+
+#IV(a) Neuroblastoma and ganglioneuroblastoma 3036 0.772
+mNB<-m[which(m$ICCCName=="IV(a) Neuroblastoma and ganglioneuroblastoma"),]
+addmargins(table(mNB$Race, mNB$death))
+NB<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race , data =mNB, ties = "breslow")
+summary(NB)
+
+NBresults<-tidy(NB)
+NBresults
+
+NB_HRBlack<-round(exp(NBresults$estimate[1]), 2)
+NB_BlackCIlow<-round(exp(NBresults$conf.low[1]), 2)
+NB_BlackCIhigh<-round(exp(NBresults$conf.high[1]),2)
+NB_HRAIAN<-round(exp(NBresults$estimate[2]),2)
+NB_AIANCIlow<-round(exp(NBresults$conf.low[2]),2)
+NB_AIANCIhigh<-round(exp(NBresults$conf.high[2]),2)
+NB_HRAsian<-round(exp(NBresults$estimate[3]),2)
+NB_AsianCIlow<-round(exp(NBresults$conf.low[3]),2)
+NB_AsianCIhigh<-round(exp(NBresults$conf.high[3]),2)
+NB_HRHispanic<-round(exp(NBresults$estimate[4]),2)
+NB_HispanicCIlow<-round(exp(NBresults$conf.low[4]),2)
+NB_HispanicCIhigh<-round(exp(NBresults$conf.high[4]),2)
+
+
+#VI(a.1) Nephroblastoma 2204 0.92
+mNeph<-m[which(m$ICCCName=="VI(a.1) Nephroblastoma"),]
+addmargins(table(mNeph$Race, mNeph$death))
+Neph<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race , data =mNeph, ties = "breslow")
+summary(Neph)
+
+Nephresults<-tidy(Neph)
+Nephresults
+
+Neph_HRBlack<-round(exp(Nephresults$estimate[1]), 2)
+Neph_BlackCIlow<-round(exp(Nephresults$conf.low[1]), 2)
+Neph_BlackCIhigh<-round(exp(Nephresults$conf.high[1]),2)
+Neph_HRAIAN<-round(exp(Nephresults$estimate[2]),2)
+Neph_AIANCIlow<-round(exp(Nephresults$conf.low[2]),2)
+Neph_AIANCIhigh<-round(exp(Nephresults$conf.high[2]),2)
+Neph_HRAsian<-round(exp(Nephresults$estimate[3]),2)
+Neph_AsianCIlow<-round(exp(Nephresults$conf.low[3]),2)
+Neph_AsianCIhigh<-round(exp(Nephresults$conf.high[3]),2)
+Neph_HRHispanic<-round(exp(Nephresults$estimate[4]),2)
+Neph_HispanicCIlow<-round(exp(Nephresults$conf.low[4]),2)
+Neph_HispanicCIhigh<-round(exp(Nephresults$conf.high[4]),2)
+
+
+#VIII(a) Osteosarcomas 1981 0.67
+mOS<-m[which(m$ICCCName=="VIII(a) Osteosarcomas"),]
+addmargins(table(mOS$Race, mOS$death))
+OS<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race , data =mOS, ties = "breslow")
+summary(OS)
+
+OSresults<-tidy(OS)
+OSresults
+
+OS_HRBlack<-round(exp(OSresults$estimate[1]), 2)
+OS_BlackCIlow<-round(exp(OSresults$conf.low[1]), 2)
+OS_BlackCIhigh<-round(exp(OSresults$conf.high[1]),2)
+OS_HRAIAN<-round(exp(OSresults$estimate[2]),2)
+OS_AIANCIlow<-round(exp(OSresults$conf.low[2]),2)
+OS_AIANCIhigh<-round(exp(OSresults$conf.high[2]),2)
+OS_HRAsian<-round(exp(OSresults$estimate[3]),2)
+OS_AsianCIlow<-round(exp(OSresults$conf.low[3]),2)
+OS_AsianCIhigh<-round(exp(OSresults$conf.high[3]),2)
+OS_HRHispanic<-round(exp(OSresults$estimate[4]),2)
+OS_HispanicCIlow<-round(exp(OSresults$conf.low[4]),2)
+OS_HispanicCIhigh<-round(exp(OSresults$conf.high[4]),2)
+
+#IX(a) IX(a) Rhabdomyosarcomas 1843 0.646
+mRab<-m[which(m$ICCCName=="IX(a) Rhabdomyosarcomas"),]
+addmargins(table(mRab$Race, mRab$death))
+Rab<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race , data =mRab, ties = "breslow")
+summary(Rab)
+
+Rabresults<-tidy(Rab)
+Rabresults
+
+Rab_HRBlack<-round(exp(Rabresults$estimate[1]), 2)
+Rab_BlackCIlow<-round(exp(Rabresults$conf.low[1]), 2)
+Rab_BlackCIhigh<-round(exp(Rabresults$conf.high[1]),2)
+Rab_HRAIAN<-round(exp(Rabresults$estimate[2]),2)
+Rab_AIANCIlow<-round(exp(Rabresults$conf.low[2]),2)
+Rab_AIANCIhigh<-round(exp(Rabresults$conf.high[2]),2)
+Rab_HRAsian<-round(exp(Rabresults$estimate[3]),2)
+Rab_AsianCIlow<-round(exp(Rabresults$conf.low[3]),2)
+Rab_AsianCIhigh<-round(exp(Rabresults$conf.high[3]),2)
+Rab_HRHispanic<-round(exp(Rabresults$estimate[4]),2)
+Rab_HispanicCIlow<-round(exp(Rabresults$conf.low[4]),2)
+Rab_HispanicCIhigh<-round(exp(Rabresults$conf.high[4]),2)
+
+#III(c.1) Medulloblastomas 1526 0.71
+mMB<-m[which(m$ICCCName=="III(c.1) Medulloblastomas"),]
+addmargins(table(mMB$Race, mMB$death))
+MB<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race , data =mMB, ties = "breslow")
+summary(MB)
+
+MBresults<-tidy(MB)
+MBresults
+
+MB_HRBlack<-round(exp(MBresults$estimate[1]), 2)
+MB_BlackCIlow<-round(exp(MBresults$conf.low[1]), 2)
+MB_BlackCIhigh<-round(exp(MBresults$conf.high[1]),2)
+MB_HRAIAN<-round(exp(MBresults$estimate[2]),2)
+MB_AIANCIlow<-round(exp(MBresults$conf.low[2]),2)
+MB_AIANCIhigh<-round(exp(MBresults$conf.high[2]),2)
+MB_HRAsian<-round(exp(MBresults$estimate[3]),2)
+MB_AsianCIlow<-round(exp(MBresults$conf.low[3]),2)
+MB_AsianCIhigh<-round(exp(MBresults$conf.high[3]),2)
+MB_HRHispanic<-round(exp(MBresults$estimate[4]),2)
+MB_HispanicCIlow<-round(exp(MBresults$conf.low[4]),2)
+MB_HispanicCIhigh<-round(exp(MBresults$conf.high[4]),2)
+
+
+#make empty data frame
+etable5<-data.frame(matrix(ncol=5, nrow=0))
+columns<-c("Cancer type", "Race", "HR", "lowCI", "UpperCI")
+colnames(etable5)<-columns
+
+#Fill data frame with model results
+etable5[1,]<-c('Rhabdomyosarcoma', 'NH Black', Rab_HRBlack, Rab_BlackCIlow, Rab_BlackCIhigh)
+etable5[2,]<-c('Rhabdomyosarcoma', 'NH American Indian/Alaska Native', Rab_HRAIAN, Rab_AIANCIlow, Rab_AIANCIhigh)
+etable5[3,]<-c('Rhabdomyosarcoma', 'NH Asian', Rab_HRAsian, Rab_AsianCIlow, Rab_AsianCIhigh)
+etable5[4,]<-c('Rhabdomyosarcoma', 'Hispanic', Rab_HRHispanic, Rab_HispanicCIlow, Rab_HispanicCIhigh)
+etable5[5,]<-c('Precursor cell leukemia', 'NH Black', PCL_HRBlack, PCL_BlackCIlow, PCL_BlackCIhigh)
+etable5[6,]<-c('Precursor cell leukemia', 'NH American Indian/Alaska Native', PCL_HRAIAN, PCL_AIANCIlow, PCL_AIANCIhigh)
+etable5[7,]<-c('Precursor cell leukemia', 'NH Asian', PCL_HRAsian, PCL_AsianCIlow, PCL_AsianCIhigh)
+etable5[8,]<-c('Precursor cell leukemia', 'Hispanic', PCL_HRHispanic, PCL_HispanicCIlow, PCL_HispanicCIhigh)
+etable5[9,]<-c('Hodgkin Lymphoma', 'NH Black', HL_HRBlack, HL_BlackCIlow, HL_BlackCIhigh)
+etable5[10,]<-c('Hodgkin Lymphoma', 'NH American Indian/Alaska Native', HL_HRAIAN, HL_AIANCIlow, HL_AIANCIhigh)
+etable5[11,]<-c('Hodgkin Lymphoma', 'NH Asian', HL_HRAsian, HL_AsianCIlow, HL_AsianCIhigh)
+etable5[12,]<-c('Hodgkin Lymphoma', 'Hispanic', HL_HRHispanic, HL_HispanicCIlow, HL_HispanicCIhigh)
+etable5[13,]<-c('Astrocytoma', 'NH Black', Astro_HRBlack, Astro_BlackCIlow, Astro_BlackCIhigh)
+etable5[14,]<-c('Astrocytoma', 'NH American Indian/Alaska Native', Astro_HRAIAN, Astro_AIANCIlow, Astro_AIANCIhigh)
+etable5[15,]<-c('Astrocytoma', 'NH Asian', Astro_HRAsian, Astro_AsianCIlow, Astro_AsianCIhigh)
+etable5[16,]<-c('Astrocytoma', 'Hispanic', Astro_HRHispanic, Astro_HispanicCIlow, Astro_HispanicCIhigh)
+etable5[17,]<-c('Acute Myeloid Leukemia', 'NH Black', AML_HRBlack, AML_BlackCIlow, AML_BlackCIhigh)
+etable5[18,]<-c('Acute Myeloid Leukemia', 'NH American Indian/Alaska Native', AML_HRAIAN, AML_AIANCIlow, AML_AIANCIhigh)
+etable5[19,]<-c('Acute Myeloid Leukemia', 'NH Asian', AML_HRAsian, AML_AsianCIlow, AML_AsianCIhigh)
+etable5[20,]<-c('Acute Myeloid Leukemia', 'Hispanic', AML_HRHispanic, AML_HispanicCIlow, AML_HispanicCIhigh)
+etable5[21,]<-c('Neuroblastoma and ganglioneuroblastoma', 'Black', NB_HRBlack, NB_BlackCIlow, NB_BlackCIhigh)
+etable5[22,]<-c('Neuroblastoma and ganglioneuroblastoma', 'NH American Indian/Alaska Native', NB_HRAIAN, NB_AIANCIlow, NB_AIANCIhigh)
+etable5[23,]<-c('Neuroblastoma and ganglioneuroblastoma', 'Asian', NB_HRAsian, NB_AsianCIlow, NB_AsianCIhigh)
+etable5[24,]<-c('Neuroblastoma and ganglioneuroblastoma', 'Hispanic', NB_HRHispanic, NB_HispanicCIlow, NB_HispanicCIhigh)
+etable5[25,]<-c('Nephroblastoma', 'NH Black', Neph_HRBlack, Neph_BlackCIlow, Neph_BlackCIhigh)
+etable5[26,]<-c('Nephroblastoma', 'NH American Indian/Alaska Native', Neph_HRAIAN, Neph_AIANCIlow, Neph_AIANCIhigh)
+etable5[27,]<-c('Nephroblastoma', 'NH Asian', Neph_HRAsian, Neph_AsianCIlow, Neph_AsianCIhigh)
+etable5[28,]<-c('Nephroblastoma', 'Hispanic', Neph_HRHispanic, Neph_HispanicCIlow, Neph_HispanicCIhigh)
+etable5[29,]<-c('Osteosarcoma', 'NH Black', OS_HRBlack, OS_BlackCIlow, OS_BlackCIhigh)
+etable5[30,]<-c('Osteosarcoma', 'NH American Indian/Alaska Native', OS_HRAIAN, OS_AIANCIlow, OS_AIANCIhigh)
+etable5[31,]<-c('Osteosarcoma', 'NH Asian', OS_HRAsian, OS_AsianCIlow, OS_AsianCIhigh)
+etable5[32,]<-c('Osteosarcoma', 'Hispanic', OS_HRHispanic, OS_HispanicCIlow, OS_HispanicCIhigh)
+etable5[33,]<-c('Medulloblastoma', 'NH Black', MB_HRBlack, MB_BlackCIlow, MB_BlackCIhigh)
+etable5[34,]<-c('Medulloblastoma', 'NH American Indian/Alaska Native', MB_HRAIAN, MB_AIANCIlow, MB_AIANCIhigh)
+etable5[35,]<-c('Medulloblastoma', 'NH Asian', MB_HRAsian, MB_AsianCIlow, MB_AsianCIhigh)
+etable5[36,]<-c('Medulloblastoma', 'Hispanic', MB_HRHispanic, MB_HispanicCIlow, MB_HispanicCIhigh)
+
+etable5$CI<-paste(etable5$lowCI, etable5$UpperCI, sep="-")
+
+write.table(etable5, "eTable5_unadj.txt",  sep="\t")
+```
+#eTable 5: Adjusted cancer disparites by cancer types with different amenability levels
+```{r}
+#I(a.1) Precursor cell leukemias 13478  0.871
+mPCL<-m[which(m$ICCCName=="I(a.1) Precursor cell leukemias"),]
+addmargins(table(mPCL$Race, mPCL$death))
+PCL<-coxph(formula = Surv(Age.at.diagnosis, stop_age,death==1) ~ Race + as.factor(edu_Cat) + as.factor(income_Cat), data =mPCL, ties = "breslow")
+summary(PCL)
+
+PCLresults<-tidy(PCL)
+PCLresults
+
+PCL_HRBlack<-round(exp(PCLresults$estimate[1]), 2)
+PCL_BlackCIlow<-round(exp(PCLresults$conf.low[1]), 2)
+PCL_BlackCIhigh<-round(exp(PCLresults$conf.high[1]),2)
+PCL_HRAIAN<-round(exp(PCLresults$estimate[2]),2)
+PCL_AIANCIlow<-round(exp(PCLresults$conf.low[2]),2)
+PCL_AIANCIhigh<-round(exp(PCLresults$conf.high[2]),2)
+PCL_HRAsian<-round(exp(PCLresults$estimate[3]),2)
+PCL_AsianCIlow<-round(exp(PCLresults$conf.low[3]),2)
+PCL_AsianCIhigh<-round(exp(PCLresults$conf.high[3]),2)
+PCL_HRHispanic<-round(exp(PCLresults$estimate[4]),2)
+PCL_HispanicCIlow<-round(exp(PCLresults$conf.low[4]),2)
+PCL_HispanicCIhigh<-round(exp(PCLresults$conf.high[4]),2)
+
+
+#II(a) Hodgkin lymphomas  4706  0.964
+mHL<-m[which(m$ICCCName=="II(a) Hodgkin lymphomas"),]
+addmargins(table(mHL$Race, mHL$death))
+HL<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race + as.factor(edu_Cat) + as.factor(income_Cat), data =mHL, ties = "breslow")
+summary(HL)
+
+
+HLresults<-tidy(HL)
+HLresults
+
+HL_HRBlack<-round(exp(HLresults$estimate[1]), 2)
+HL_BlackCIlow<-round(exp(HLresults$conf.low[1]), 2)
+HL_BlackCIhigh<-round(exp(HLresults$conf.high[1]),2)
+HL_HRAIAN<-round(exp(HLresults$estimate[2]),2)
+HL_AIANCIlow<-round(exp(HLresults$conf.low[2]),2)
+HL_AIANCIhigh<-round(exp(HLresults$conf.high[2]),2)
+HL_HRAsian<-round(exp(HLresults$estimate[3]),2)
+HL_AsianCIlow<-round(exp(HLresults$conf.low[3]),2)
+HL_AsianCIhigh<-round(exp(HLresults$conf.high[3]),2)
+HL_HRHispanic<-round(exp(HLresults$estimate[4]),2)
+HL_HispanicCIlow<-round(exp(HLresults$conf.low[4]),2)
+HL_HispanicCIhigh<-round(exp(HLresults$conf.high[4]),2)
+
+
+#III(b) Astrocytomas 5781 0.824
+mAstro<-m[which(m$ICCCName=="III(b) Astrocytomas"),]
+addmargins(table(mAstro$Race, mAstro$death))
+Astro<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race + as.factor(edu_Cat) + as.factor(income_Cat), data =mAstro, ties = "breslow")
+summary(Astro)
+
+Astroresults<-tidy(Astro)
+Astroresults
+
+Astro_HRBlack<-round(exp(Astroresults$estimate[1]), 2)
+Astro_BlackCIlow<-round(exp(Astroresults$conf.low[1]), 2)
+Astro_BlackCIhigh<-round(exp(Astroresults$conf.high[1]),2)
+Astro_HRAIAN<-round(exp(Astroresults$estimate[2]),2)
+Astro_AIANCIlow<-round(exp(Astroresults$conf.low[2]),2)
+Astro_AIANCIhigh<-round(exp(Astroresults$conf.high[2]),2)
+Astro_HRAsian<-round(exp(Astroresults$estimate[3]),2)
+Astro_AsianCIlow<-round(exp(Astroresults$conf.low[3]),2)
+Astro_AsianCIhigh<-round(exp(Astroresults$conf.high[3]),2)
+Astro_HRHispanic<-round(exp(Astroresults$estimate[4]),2)
+Astro_HispanicCIlow<-round(exp(Astroresults$conf.low[4]),2)
+Astro_HispanicCIhigh<-round(exp(Astroresults$conf.high[4]),2)
+
+
+#I(b) Acute myeloid leukemias  0.611
+mAML<-m[which(m$ICCCName=="I(b) Acute myeloid leukemias"),]
+addmargins(table(mAML$Race, mAML$death))
+AML<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race + as.factor(edu_Cat) + as.factor(income_Cat), data =mAML, ties = "breslow")
+summary(AML)
+
+AMLresults<-tidy(AML)
+AMLresults
+
+AML_HRBlack<-round(exp(AMLresults$estimate[1]), 2)
+AML_BlackCIlow<-round(exp(AMLresults$conf.low[1]), 2)
+AML_BlackCIhigh<-round(exp(AMLresults$conf.high[1]),2)
+AML_HRAIAN<-round(exp(AMLresults$estimate[2]),2)
+AML_AIANCIlow<-round(exp(AMLresults$conf.low[2]),2)
+AML_AIANCIhigh<-round(exp(AMLresults$conf.high[2]),2)
+AML_HRAsian<-round(exp(AMLresults$estimate[3]),2)
+AML_AsianCIlow<-round(exp(AMLresults$conf.low[3]),2)
+AML_AsianCIhigh<-round(exp(AMLresults$conf.high[3]),2)
+AML_HRHispanic<-round(exp(AMLresults$estimate[4]),2)
+AML_HispanicCIlow<-round(exp(AMLresults$conf.low[4]),2)
+AML_HispanicCIhigh<-round(exp(AMLresults$conf.high[4]),2)
+
+
+#IV(a) Neuroblastoma and ganglioneuroblastoma 3036 0.772
+mNB<-m[which(m$ICCCName=="IV(a) Neuroblastoma and ganglioneuroblastoma"),]
+addmargins(table(mNB$Race, mNB$death))
+NB<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race + as.factor(edu_Cat) + as.factor(income_Cat), data =mNB, ties = "breslow")
+summary(NB)
+
+NBresults<-tidy(NB)
+NBresults
+
+NB_HRBlack<-round(exp(NBresults$estimate[1]), 2)
+NB_BlackCIlow<-round(exp(NBresults$conf.low[1]), 2)
+NB_BlackCIhigh<-round(exp(NBresults$conf.high[1]),2)
+NB_HRAIAN<-round(exp(NBresults$estimate[2]),2)
+NB_AIANCIlow<-round(exp(NBresults$conf.low[2]),2)
+NB_AIANCIhigh<-round(exp(NBresults$conf.high[2]),2)
+NB_HRAsian<-round(exp(NBresults$estimate[3]),2)
+NB_AsianCIlow<-round(exp(NBresults$conf.low[3]),2)
+NB_AsianCIhigh<-round(exp(NBresults$conf.high[3]),2)
+NB_HRHispanic<-round(exp(NBresults$estimate[4]),2)
+NB_HispanicCIlow<-round(exp(NBresults$conf.low[4]),2)
+NB_HispanicCIhigh<-round(exp(NBresults$conf.high[4]),2)
+
+
+#VI(a.1) Nephroblastoma 2204 0.92
+mNeph<-m[which(m$ICCCName=="VI(a.1) Nephroblastoma"),]
+addmargins(table(mNeph$Race, mNeph$death))
+Neph<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race + as.factor(edu_Cat) + as.factor(income_Cat), data =mNeph, ties = "breslow")
+summary(Neph)
+
+Nephresults<-tidy(Neph)
+Nephresults
+
+Neph_HRBlack<-round(exp(Nephresults$estimate[1]), 2)
+Neph_BlackCIlow<-round(exp(Nephresults$conf.low[1]), 2)
+Neph_BlackCIhigh<-round(exp(Nephresults$conf.high[1]),2)
+Neph_HRAIAN<-round(exp(Nephresults$estimate[2]),2)
+Neph_AIANCIlow<-round(exp(Nephresults$conf.low[2]),2)
+Neph_AIANCIhigh<-round(exp(Nephresults$conf.high[2]),2)
+Neph_HRAsian<-round(exp(Nephresults$estimate[3]),2)
+Neph_AsianCIlow<-round(exp(Nephresults$conf.low[3]),2)
+Neph_AsianCIhigh<-round(exp(Nephresults$conf.high[3]),2)
+Neph_HRHispanic<-round(exp(Nephresults$estimate[4]),2)
+Neph_HispanicCIlow<-round(exp(Nephresults$conf.low[4]),2)
+Neph_HispanicCIhigh<-round(exp(Nephresults$conf.high[4]),2)
+
+
+#VIII(a) Osteosarcomas 1981 0.67
+mOS<-m[which(m$ICCCName=="VIII(a) Osteosarcomas"),]
+addmargins(table(mOS$Race, mOS$death))
+OS<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race +  as.factor(edu_Cat) + as.factor(income_Cat), data =mOS, ties = "breslow")
+summary(OS)
+
+OSresults<-tidy(OS)
+OSresults
+
+OS_HRBlack<-round(exp(OSresults$estimate[1]), 2)
+OS_BlackCIlow<-round(exp(OSresults$conf.low[1]), 2)
+OS_BlackCIhigh<-round(exp(OSresults$conf.high[1]),2)
+OS_HRAIAN<-round(exp(OSresults$estimate[2]),2)
+OS_AIANCIlow<-round(exp(OSresults$conf.low[2]),2)
+OS_AIANCIhigh<-round(exp(OSresults$conf.high[2]),2)
+OS_HRAsian<-round(exp(OSresults$estimate[3]),2)
+OS_AsianCIlow<-round(exp(OSresults$conf.low[3]),2)
+OS_AsianCIhigh<-round(exp(OSresults$conf.high[3]),2)
+OS_HRHispanic<-round(exp(OSresults$estimate[4]),2)
+OS_HispanicCIlow<-round(exp(OSresults$conf.low[4]),2)
+OS_HispanicCIhigh<-round(exp(OSresults$conf.high[4]),2)
+
+#IX(a) IX(a) Rhabdomyosarcomas 1843 0.646
+mRab<-m[which(m$ICCCName=="IX(a) Rhabdomyosarcomas"),]
+addmargins(table(mRab$Race, mRab$death))
+Rab<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race +  as.factor(edu_Cat) + as.factor(income_Cat), data =mRab, ties = "breslow")
+summary(Rab)
+
+Rabresults<-tidy(Rab)
+Rabresults
+
+Rab_HRBlack<-round(exp(Rabresults$estimate[1]), 2)
+Rab_BlackCIlow<-round(exp(Rabresults$conf.low[1]), 2)
+Rab_BlackCIhigh<-round(exp(Rabresults$conf.high[1]),2)
+Rab_HRAIAN<-round(exp(Rabresults$estimate[2]),2)
+Rab_AIANCIlow<-round(exp(Rabresults$conf.low[2]),2)
+Rab_AIANCIhigh<-round(exp(Rabresults$conf.high[2]),2)
+Rab_HRAsian<-round(exp(Rabresults$estimate[3]),2)
+Rab_AsianCIlow<-round(exp(Rabresults$conf.low[3]),2)
+Rab_AsianCIhigh<-round(exp(Rabresults$conf.high[3]),2)
+Rab_HRHispanic<-round(exp(Rabresults$estimate[4]),2)
+Rab_HispanicCIlow<-round(exp(Rabresults$conf.low[4]),2)
+Rab_HispanicCIhigh<-round(exp(Rabresults$conf.high[4]),2)
+
+#III(c.1) Medulloblastomas 1526 0.71
+mMB<-m[which(m$ICCCName=="III(c.1) Medulloblastomas"),]
+addmargins(table(mMB$Race, mMB$death))
+MB<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race +  as.factor(edu_Cat) + as.factor(income_Cat), data =mMB, ties = "breslow")
+summary(MB)
+
+MBresults<-tidy(MB)
+MBresults
+
+MB_HRBlack<-round(exp(MBresults$estimate[1]), 2)
+MB_BlackCIlow<-round(exp(MBresults$conf.low[1]), 2)
+MB_BlackCIhigh<-round(exp(MBresults$conf.high[1]),2)
+MB_HRAIAN<-round(exp(MBresults$estimate[2]),2)
+MB_AIANCIlow<-round(exp(MBresults$conf.low[2]),2)
+MB_AIANCIhigh<-round(exp(MBresults$conf.high[2]),2)
+MB_HRAsian<-round(exp(MBresults$estimate[3]),2)
+MB_AsianCIlow<-round(exp(MBresults$conf.low[3]),2)
+MB_AsianCIhigh<-round(exp(MBresults$conf.high[3]),2)
+MB_HRHispanic<-round(exp(MBresults$estimate[4]),2)
+MB_HispanicCIlow<-round(exp(MBresults$conf.low[4]),2)
+MB_HispanicCIhigh<-round(exp(MBresults$conf.high[4]),2)
+
+
+#make empty data frame
+etable5<-data.frame(matrix(ncol=5, nrow=0))
+columns<-c("Cancer type", "Race", "HR", "lowCI", "UpperCI")
+colnames(etable5)<-columns
+
+#Fill data frame with model results
+etable5[1,]<-c('Rhabdomyosarcoma', 'NH Black', Rab_HRBlack, Rab_BlackCIlow, Rab_BlackCIhigh)
+etable5[2,]<-c('Rhabdomyosarcoma', 'NH American Indian/Alaska Native', Rab_HRAIAN, Rab_AIANCIlow, Rab_AIANCIhigh)
+etable5[3,]<-c('Rhabdomyosarcoma', 'NH Asian', Rab_HRAsian, Rab_AsianCIlow, Rab_AsianCIhigh)
+etable5[4,]<-c('Rhabdomyosarcoma', 'Hispanic', Rab_HRHispanic, Rab_HispanicCIlow, Rab_HispanicCIhigh)
+etable5[5,]<-c('Precursor cell leukemia', 'NH Black', PCL_HRBlack, PCL_BlackCIlow, PCL_BlackCIhigh)
+etable5[6,]<-c('Precursor cell leukemia', 'NH American Indian/Alaska Native', PCL_HRAIAN, PCL_AIANCIlow, PCL_AIANCIhigh)
+etable5[7,]<-c('Precursor cell leukemia', 'NH Asian', PCL_HRAsian, PCL_AsianCIlow, PCL_AsianCIhigh)
+etable5[8,]<-c('Precursor cell leukemia', 'Hispanic', PCL_HRHispanic, PCL_HispanicCIlow, PCL_HispanicCIhigh)
+etable5[9,]<-c('Hodgkin Lymphoma', 'NH Black', HL_HRBlack, HL_BlackCIlow, HL_BlackCIhigh)
+etable5[10,]<-c('Hodgkin Lymphoma', 'NH American Indian/Alaska Native', HL_HRAIAN, HL_AIANCIlow, HL_AIANCIhigh)
+etable5[11,]<-c('Hodgkin Lymphoma', 'NH Asian', HL_HRAsian, HL_AsianCIlow, HL_AsianCIhigh)
+etable5[12,]<-c('Hodgkin Lymphoma', 'Hispanic', HL_HRHispanic, HL_HispanicCIlow, HL_HispanicCIhigh)
+etable5[13,]<-c('Astrocytoma', 'NH Black', Astro_HRBlack, Astro_BlackCIlow, Astro_BlackCIhigh)
+etable5[14,]<-c('Astrocytoma', 'NH American Indian/Alaska Native', Astro_HRAIAN, Astro_AIANCIlow, Astro_AIANCIhigh)
+etable5[15,]<-c('Astrocytoma', 'NH Asian', Astro_HRAsian, Astro_AsianCIlow, Astro_AsianCIhigh)
+etable5[16,]<-c('Astrocytoma', 'Hispanic', Astro_HRHispanic, Astro_HispanicCIlow, Astro_HispanicCIhigh)
+etable5[17,]<-c('Acute Myeloid Leukemia', 'NH Black', AML_HRBlack, AML_BlackCIlow, AML_BlackCIhigh)
+etable5[18,]<-c('Acute Myeloid Leukemia', 'NH American Indian/Alaska Native', AML_HRAIAN, AML_AIANCIlow, AML_AIANCIhigh)
+etable5[19,]<-c('Acute Myeloid Leukemia', 'NH Asian', AML_HRAsian, AML_AsianCIlow, AML_AsianCIhigh)
+etable5[20,]<-c('Acute Myeloid Leukemia', 'Hispanic', AML_HRHispanic, AML_HispanicCIlow, AML_HispanicCIhigh)
+etable5[21,]<-c('Neuroblastoma and ganglioneuroblastoma', 'Black', NB_HRBlack, NB_BlackCIlow, NB_BlackCIhigh)
+etable5[22,]<-c('Neuroblastoma and ganglioneuroblastoma', 'NH American Indian/Alaska Native', NB_HRAIAN, NB_AIANCIlow, NB_AIANCIhigh)
+etable5[23,]<-c('Neuroblastoma and ganglioneuroblastoma', 'Asian', NB_HRAsian, NB_AsianCIlow, NB_AsianCIhigh)
+etable5[24,]<-c('Neuroblastoma and ganglioneuroblastoma', 'Hispanic', NB_HRHispanic, NB_HispanicCIlow, NB_HispanicCIhigh)
+etable5[25,]<-c('Nephroblastoma', 'NH Black', Neph_HRBlack, Neph_BlackCIlow, Neph_BlackCIhigh)
+etable5[26,]<-c('Nephroblastoma', 'NH American Indian/Alaska Native', Neph_HRAIAN, Neph_AIANCIlow, Neph_AIANCIhigh)
+etable5[27,]<-c('Nephroblastoma', 'NH Asian', Neph_HRAsian, Neph_AsianCIlow, Neph_AsianCIhigh)
+etable5[28,]<-c('Nephroblastoma', 'Hispanic', Neph_HRHispanic, Neph_HispanicCIlow, Neph_HispanicCIhigh)
+etable5[29,]<-c('Osteosarcoma', 'NH Black', OS_HRBlack, OS_BlackCIlow, OS_BlackCIhigh)
+etable5[30,]<-c('Osteosarcoma', 'NH American Indian/Alaska Native', OS_HRAIAN, OS_AIANCIlow, OS_AIANCIhigh)
+etable5[31,]<-c('Osteosarcoma', 'NH Asian', OS_HRAsian, OS_AsianCIlow, OS_AsianCIhigh)
+etable5[32,]<-c('Osteosarcoma', 'Hispanic', OS_HRHispanic, OS_HispanicCIlow, OS_HispanicCIhigh)
+etable5[33,]<-c('Medulloblastoma', 'NH Black', MB_HRBlack, MB_BlackCIlow, MB_BlackCIhigh)
+etable5[34,]<-c('Medulloblastoma', 'NH American Indian/Alaska Native', MB_HRAIAN, MB_AIANCIlow, MB_AIANCIhigh)
+etable5[35,]<-c('Medulloblastoma', 'NH Asian', MB_HRAsian, MB_AsianCIlow, MB_AsianCIhigh)
+etable5[36,]<-c('Medulloblastoma', 'Hispanic', MB_HRHispanic, MB_HispanicCIlow, MB_HispanicCIhigh)
+
+etable5$CI<-paste(etable5$lowCI, etable5$UpperCI, sep="-")
+
+write.table(etable5, "eTable5.txt",  sep="\t")
+```
+
+# Check assumptions
+```{r}
+#Check proportional hazards assumption for 
+#scaled Schoenfeld residuals
+#Adjusted All races by category 
+category.mod1<-coxph(Surv(Survival.months,death==1)~Race + RSR_Cat + Race*RSR_Cat+ as.factor(edu_Cat)+as.factor(income_Cat), m, ties="breslow") 
+summary(category.mod1)
+test.ph <- cox.zph(category.mod1)
+test.ph
+
+#plot
+ggcoxzph(test.ph)
+plot(test.ph)
+
+#log-log survival curves
+cancersurv=Surv(m$Survival.months,m$death==1)
+cancersurv
+plot(survfit(cancersurv ~ m$Race), col=c("black", "red"), fun="cloglog") 
+plot(survfit(cancersurv ~ m$RSR_Cat), col=c("black", "red"), fun="cloglog") 
+
+#influential observations
+category.mod1s<-coxph(Surv(Survival.months,death==1)~Race+Relative+edu_Cat+income_Cat, m, ties="breslow") 
+summary(category.mod1s)
+
+#DF beta (plots estimtated changes in regression coefficients removing one at a time)
+ggcoxdiagnostics(category.mod1, type = "dfbeta", linear.predictions = FALSE, ggtheme = theme_bw(), method="auto")
+```
