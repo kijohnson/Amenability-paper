@@ -32,7 +32,7 @@ library(broom) #etable 5
 CancerAmenability <- read.csv ("CancerAmenability7.csv")
 #update for revision to 2016 dx
 RSR <- read.csv("RSR13.csv") #relative survival rate data for childhood cancers
-m <- merge(CancerAmenability,RSR)
+m<- merge(CancerAmenability,RSR, by="ICCC.site.rec.extended.ICD.O.3.WHO.2008")
 ```
 
 #Load function to calculate Wald interaction p-values (courtesy of coauthor Justin Barnes)
@@ -1385,7 +1385,6 @@ mMB<-m[which(m$ICCCName=="III(c.1) Medulloblastomas"),]
 addmargins(table(mMB$Race, mMB$death))
 MB<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race , data =mMB, ties = "breslow")
 summary(MB)
-
 MBresults<-tidy(MB)
 MBresults
 
@@ -1407,6 +1406,7 @@ MB_HispanicCIhigh<-round(exp(MBresults$conf.high[4]),2)
 etable5<-data.frame(matrix(ncol=5, nrow=0))
 columns<-c("Cancer type", "Race", "HR", "lowCI", "UpperCI")
 colnames(etable5)<-columns
+
 
 #Fill data frame with model results
 etable5[1,]<-c('Rhabdomyosarcoma', 'NH Black', Rab_HRBlack, Rab_BlackCIlow, Rab_BlackCIhigh)
