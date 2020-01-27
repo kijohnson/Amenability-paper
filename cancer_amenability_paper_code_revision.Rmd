@@ -14,9 +14,9 @@
 #install.packages("survminer") #for pairwise diffs
 #install.packages("survival")
 #install.packages("ggplot")
-#install.packages("multcomp") #for contrasts
+install.packages("multcomp") #for contrasts
 #install.packages("stringr")
-#install.packages("survivalAnalysis")
+install.packages("survivalAnalysis")
 #install.packages("broom") #for etable5 extraction of coefficients from models
 library(survival) #for calculating KM values
 library(survminer) #for pairwise diffs
@@ -85,13 +85,13 @@ colnames(m)[colnames(m)=="ICCC.site.rec.extended.ICD.O.3.WHO.2008"]<-"ICCCnumber
 colnames(m)[colnames(m)=="SEER.historic.stage.A..1973.2015."]<-"Stage"
 
 #Remove missing values from dataset
-m <- m[which(m$Race<9),] #9=Non-Hispanic unknown race
-m <- m[which(m$death<8),] #8=Missing/unknown COD, 9=N/A not first tumor
-m <- m[which(m$Survival.months<9999),] #9999=unknown
-m <- m[which(m$Relative>0),]
-m <- m[which(m$ICCCnumber<253),] #253=Not classified by ICCC or in situ
-m <- m[which(m$education<16382),] #16382=Blank(s)
-m <- m[which(m$income<16382),] #16382=Blank(s)
+m <- m[which(m$Race<9),] #9=Non-Hispanic unknown race n=779
+m <- m[which(m$death<8),] #8=Missing/unknown COD, 9=N/A not first tumor  n=371
+m <- m[which(m$Survival.months<9999),] #9999=unknown n=122
+m <- m[which(m$Relative>0),] #n=10
+m <- m[which(m$ICCCnumber<253),] #253=Not classified by ICCC or in situ n=92
+m <- m[which(m$education<16382),] #16382=Blank(s) n=34
+m <- m[which(m$income<16382),] #16382=Blank(s) n=0
 
 #fix year values by adding 1800 per SEER data dictionary instructions
 m$Year.of.birth<-m$Year.of.birth+1800
@@ -349,6 +349,42 @@ summary(m$surv)
 summary(m$Survival.months/12)
 
 ```
+#Code for flowchart
+```{r}
+#eFigure 2: flowchart
+#Make flow chart in R
+
+#install.packages("DiagrammeR")
+library(DiagrammeR)
+grViz("digraph flowchart {
+
+      # node definitions with substituted label text
+      node [fontname = Helvetica, shape = rectangle]        
+      tab1 [label = '@@1']
+      tab2 [label = '@@2']
+      tab3 [label = '@@3']
+      tab4 [label = '@@4']
+      tab5 [label = '@@5']
+      tab6 [label = '@@6']
+      tab7 [label = '@@7']
+      tab8 [label = '@@8']
+
+      # edge definitions with the node IDs
+      tab1 -> tab2 -> tab3 -> tab4 -> tab5 -> tab6 -> tab7 -> tab8;
+      }
+
+      [1]: 'Records received from SEER 18 for diagnoses at ages 0-19 years from 2000-2016 n=68 684'
+      [2]: 'Records after excluding those with unknown race/ethnicity n=67 905'
+      [3]: 'Records after excluding those with missing and unspecified values for survival status n=67 534'
+      [4]: 'Records after excluding individuals with unknown survival time n=67 412'
+      [5]: 'Records after excluding individuals with cancers with a relative survival rate of 0% n=67 402'
+      [6]: 'Records after excluding individuals with cancers not classified by the ICCC or in situ cancers n=67 310'
+      [6]: 'Records after excluding individuals missing income and education n=67 276'
+      [7]: 'Records after excluding those with other and unspecified malignant neoplasms n=67 061'
+      ")
+```
+
+
 #Table 1
 ```{r}
 #Descriptive demographics
@@ -377,7 +413,7 @@ quantile(m[which(m$RSR_Cat=="medium amenability"),]$Relative)
 quantile(m[which(m$RSR_Cat=="high amenability"),]$Relative)
 
 #for variables, use table 1 function
-table1(~ Relative + Survival.months+Sex + Age.at.diagnosis + Age + Race|RSR_Cat, m)
+table1(~ Relative + Survival.months+Sex + Age.at.diagnosis + Age + Race +ICCCName|RSR_Cat, m)
 ```
 #Table 2 - Cox models (unadjusted)
 ```{r}
@@ -871,6 +907,7 @@ wald.wrapper(category.mod1s,"AIAN","RSR")[1]
 wald.wrapper(category.mod1s,"Asian","RSR")[1]
 wald.wrapper(category.mod1s,"Hispanic","RSR")[1]
 ```
+
 #eTable 3 - Cox models with insurance status (supplement adjusted)
 ```{r}
 #adjusted
@@ -1162,6 +1199,7 @@ print(d, surv.plot.height = 1,
 #I(a.1) Precursor cell leukemias 13478  0.871
 mPCL<-m[which(m$ICCCName=="I(a.1) Precursor cell leukemias"),]
 addmargins(table(mPCL$Race, mPCL$death))
+
 PCL<-coxph(formula = Surv(Age.at.diagnosis, stop_age,death==1) ~ Race, data =mPCL, ties = "breslow")
 summary(PCL)
 
@@ -1409,6 +1447,7 @@ etable5[35,]<-c('Medulloblastoma', 'NH Asian', MB_HRAsian, MB_AsianCIlow, MB_Asi
 etable5[36,]<-c('Medulloblastoma', 'Hispanic', MB_HRHispanic, MB_HispanicCIlow, MB_HispanicCIhigh)
 
 etable5$CI<-paste(etable5$lowCI, etable5$UpperCI, sep="-")
+etable5
 
 write.table(etable5, "eTable5_unadj.txt",  sep="\t")
 ```
@@ -1578,6 +1617,7 @@ OS_HispanicCIhigh<-round(exp(OSresults$conf.high[4]),2)
 #IX(a) IX(a) Rhabdomyosarcomas 1843 0.646
 mRab<-m[which(m$ICCCName=="IX(a) Rhabdomyosarcomas"),]
 addmargins(table(mRab$Race, mRab$death))
+
 Rab<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race +  as.factor(edu_Cat) + as.factor(income_Cat), data =mRab, ties = "breslow")
 summary(Rab)
 
@@ -1602,7 +1642,7 @@ mMB<-m[which(m$ICCCName=="III(c.1) Medulloblastomas"),]
 addmargins(table(mMB$Race, mMB$death))
 MB<-coxph(formula = Surv(Age.at.diagnosis,stop_age,death==1) ~ Race +  as.factor(edu_Cat) + as.factor(income_Cat), data =mMB, ties = "breslow")
 summary(MB)
-
+`
 MBresults<-tidy(MB)
 MBresults
 
